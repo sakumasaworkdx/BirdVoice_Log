@@ -1,16 +1,324 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="ja">
 <head>
-    <meta charset="UTF-8">
-    <title>BirdVoice Fast</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>野鳥の鳴き声 解析・可視化（巨大ファイル対応）</title>
+  <style>
+    :root{
+      --bg:#0b1220;
+      --panel:#0f1b33;
+      --panel2:#0d1730;
+      --text:#e8eefc;
+      --muted:#a9b6d6;
+      --line:rgba(255,255,255,.10);
+      --accent:#6ee7ff;
+      --accent2:#a78bfa;
+      --danger:#ff6b6b;
+      --ok:#34d399;
+      --shadow: 0 10px 30px rgba(0,0,0,.35);
+      --radius: 16px;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans JP", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Yu Gothic", "Meiryo", Arial, sans-serif;
+      background: radial-gradient(1000px 700px at 20% -10%, rgba(110,231,255,.18), transparent 55%),
+                  radial-gradient(900px 650px at 110% 10%, rgba(167,139,250,.16), transparent 55%),
+                  linear-gradient(180deg, var(--bg), #070b14 70%);
+      color:var(--text);
+      min-height:100vh;
+    }
+    header{
+      padding:28px 18px 14px;
+      max-width:1100px;
+      margin:0 auto;
+    }
+    .title{
+      display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+    }
+    .badge{
+      font-size:12px;
+      padding:6px 10px;
+      border:1px solid var(--line);
+      border-radius:999px;
+      background:rgba(255,255,255,.05);
+      color:var(--muted);
+    }
+    h1{
+      margin:0;
+      font-size:20px;
+      letter-spacing:.2px;
+    }
+    p{
+      margin:10px 0 0;
+      color:var(--muted);
+      line-height:1.5;
+      font-size:13px;
+    }
+    main{
+      max-width:1100px;
+      margin:0 auto;
+      padding:12px 18px 34px;
+    }
+    .panel{
+      background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+      border:1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .controls{
+      padding:14px;
+      display:grid;
+      gap:10px;
+    }
+    .row{
+      display:flex;
+      flex-wrap:wrap;
+      gap:10px;
+      align-items:center;
+      justify-content:space-between;
+    }
+    .row-left{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+    .row-right{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+    .field{
+      display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+      padding:10px 12px;
+      border:1px solid var(--line);
+      border-radius:12px;
+      background:rgba(0,0,0,.18);
+    }
+    .field label{font-size:12px; color:var(--muted)}
+    input[type="file"]{color:var(--muted)}
+    input[type="number"]{
+      width:84px;
+      padding:8px 10px;
+      border-radius:10px;
+      border:1px solid var(--line);
+      background:rgba(0,0,0,.25);
+      color:var(--text);
+      outline:none;
+    }
+    button{
+      appearance:none;
+      border:1px solid var(--line);
+      background: linear-gradient(180deg, rgba(110,231,255,.18), rgba(110,231,255,.06));
+      color:var(--text);
+      padding:10px 12px;
+      border-radius:12px;
+      cursor:pointer;
+      transition: transform .06s ease, filter .12s ease, opacity .12s ease;
+      font-weight:600;
+      letter-spacing:.2px;
+      font-size:13px;
+    }
+    button:hover{filter:brightness(1.08)}
+    button:active{transform:translateY(1px)}
+    button.secondary{
+      background: linear-gradient(180deg, rgba(167,139,250,.18), rgba(167,139,250,.06));
+    }
+    button.danger{
+      background: linear-gradient(180deg, rgba(255,107,107,.22), rgba(255,107,107,.08));
+    }
+    button:disabled{
+      opacity:.45;
+      cursor:not-allowed;
+      filter:grayscale(.2);
+    }
+    .progress{
+      padding:0 14px 14px;
+      display:grid;
+      gap:8px;
+    }
+    .bar{
+      height:10px;
+      border-radius:999px;
+      border:1px solid var(--line);
+      background:rgba(0,0,0,.25);
+      overflow:hidden;
+    }
+    .bar > div{
+      height:100%;
+      width:0%;
+      background: linear-gradient(90deg, rgba(110,231,255,.95), rgba(167,139,250,.95));
+      transition: width .15s ease;
+    }
+    .meta{
+      display:flex;
+      flex-wrap:wrap;
+      gap:10px 14px;
+      color:var(--muted);
+      font-size:12px;
+      align-items:center;
+      justify-content:space-between;
+    }
+    .meta strong{color:var(--text)}
+    .warn{
+      color:#ffd18a;
+    }
+    .cards{
+      margin-top:14px;
+      display:grid;
+      gap:12px;
+    }
+    .card{
+      border:1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.02));
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .card-head{
+      padding:12px 12px 10px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      border-bottom:1px solid var(--line);
+      background: rgba(0,0,0,.12);
+    }
+    .card-head .left{
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+      min-width:0;
+    }
+    .card-head .t{
+      font-weight:700;
+      font-size:13px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .card-head .s{
+      font-size:12px;
+      color:var(--muted);
+    }
+    .card-body{
+      padding:10px 12px 12px;
+    }
+    canvas{
+      width:100%;
+      height:auto;
+      border-radius:12px;
+      border:1px solid var(--line);
+      background: #050913;
+    }
+    .footer-note{
+      margin-top:12px;
+      padding:12px 14px;
+      border-top:1px solid var(--line);
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.5;
+      background: rgba(0,0,0,.10);
+    }
+    .pill{
+      padding:4px 8px;
+      border:1px solid var(--line);
+      border-radius:999px;
+      background:rgba(255,255,255,.04);
+      color:var(--muted);
+      font-size:12px;
+      white-space:nowrap;
+    }
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
+    .log{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size:12px;
+      color:var(--muted);
+      white-space:pre-wrap;
+      line-height:1.45;
+      padding:12px 14px;
+      border-top:1px solid var(--line);
+      background: rgba(0,0,0,.16);
+      max-height:220px;
+      overflow:auto;
+    }
+    a{color:var(--accent)}
+  </style>
 </head>
 <body>
-    <h1>野鳥音声解析(軽量版)</h1>
-    <input type="file" id="audioFile">
-    <button onclick="startAnalysis()">解析実行</button>
-    <div id="status"></div>
-    <div id="result"></div>
+  <header>
+    <div class="title">
+      <h1>野鳥の鳴き声 解析・可視化（巨大ファイル対応）</h1>
+      <span class="badge">Web Audio API + Canvas</span>
+      <span class="badge">5秒分割 / 3秒重複</span>
+      <span class="badge">スライス処理</span>
+    </div>
+    <p>
+      数GB級ファイル対策として、<span class="mono">file.slice()</span>で必要区間のBlobだけを取り出し、区間ごとにスペクトログラムを生成します。<br/>
+      ※ MP3の可変ビットレート等では時間→バイト換算が誤差を含むため、再生は「元ファイルをシークして5秒だけ再生」を推奨（カードの再生ボタンはこれを使用）。
+    </p>
+  </header>
 
-    <script src="script.js"></script>
+  <main>
+    <section class="panel">
+      <div class="controls">
+        <div class="row">
+          <div class="row-left">
+            <div class="field">
+              <label>音声ファイル</label>
+              <input id="fileInput" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg" />
+            </div>
+
+            <div class="field">
+              <label>FFTサイズ</label>
+              <input id="fftSize" type="number" min="512" max="8192" step="512" value="2048" />
+              <span class="pill">大きいほど周波数分解能↑</span>
+            </div>
+
+            <div class="field">
+              <label>解析FPS</label>
+              <input id="fps" type="number" min="10" max="120" step="1" value="60" />
+              <span class="pill">時間分解能（列数）</span>
+            </div>
+
+            <div class="field">
+              <label>最大カード数</label>
+              <input id="maxCards" type="number" min="1" max="5000" step="1" value="300" />
+              <span class="pill warn">※増やすと時間/メモリ増</span>
+            </div>
+          </div>
+
+          <div class="row-right">
+            <button id="analyzeBtn">解析実行</button>
+            <button id="stopBtn" class="danger" disabled>停止</button>
+            <button id="clearBtn" class="secondary">クリア</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="progress">
+        <div class="bar"><div id="barFill"></div></div>
+        <div class="meta">
+          <div>
+            <span class="pill">区間: <strong id="segLabel">-</strong></span>
+            <span class="pill">ファイル長: <strong id="durLabel">-</strong></span>
+            <span class="pill">推定B/s: <strong id="bpsLabel">-</strong></span>
+          </div>
+          <div>
+            <span class="pill">状態: <strong id="stateLabel">待機</strong></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="footer-note">
+        <div>・解析は区間ごとに実行し、Canvasに声紋（スペクトログラム）を描画します。</div>
+        <div>・カードの再生ボタンは「元ファイルをシークしてその5秒だけ再生」するため、巨大ファイルでも安定します。</div>
+        <div>・GitHub Pagesでも動作（外部ライブラリ不要）。</div>
+      </div>
+
+      <div id="log" class="log" aria-live="polite"></div>
+    </section>
+
+    <section class="cards" id="cards"></section>
+
+    <!-- 元ファイル再生用（解析中はミュート、カード再生で短時間だけ鳴らす） -->
+    <audio id="fullAudio" controls style="width:100%; margin-top:14px; display:none;"></audio>
+  </main>
+
+  <script src="./script.js"></script>
 </body>
 </html>
