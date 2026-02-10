@@ -2,18 +2,15 @@
 'use strict';
 
 /**
- * v3 修正（重要）
- * - 以前: getByteFrequencyData(0..255) に対して log10 をかけてしまい、ほぼ真っ白になりやすかった
- * - 今回: getFloatFrequencyData(dB) を使い、dBをそのまま正規化して白背景/黒インクで描画
+ * v4 重要修正（白紙問題の原因）
+ * - <audio>.muted = true にすると、MediaElementSource への入力も「無音」扱いになりやすく、
+ *   analyser が常に最小dB(=白)になっていました。
+ * - 対策: muted を使わず、audio.volume=1.0 のまま WebAudio 側の Gain(0) で無音化。
  *
- * 追加の安定化（MP3/VBR対策）
- * - WAVは時間→バイトが比較的正確なので slice解析
- * - MP3など圧縮音声は sliceの時間ズレ/境界で無音になりがち
- *   → 解析だけは「元ファイル（別audio）をシークして5秒だけ無音再生」方式に自動フォールバック
- *
- * 巨大ファイル対策
- * - file.arrayBuffer() 全読み込み禁止
- * - sliceまたはシーク再生で区間ごとに解析（メモリ一定）
+ * 解析方式（安定優先）
+ * - 全形式で「元ファイルをシークして5秒だけ無音解析」を使用
+ *   （巨大ファイルでもブラウザは全読み込みせず、メモリ一定）
+ * - これで MP3(VBR) の sliceズレ / WAVヘッダ問題 を避けます。
  *
  * PNG一括(ZIP): 外部ライブラリなし（ZIP STORE）
  */
@@ -67,7 +64,7 @@ function fmtBytes(n) {
 function zpad(num, len){ return String(num).padStart(len,'0'); }
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-/** ========== スペクトログラム描画（dBをそのまま使う） ========== */
+/** ========= スペクトログラム描画（dB） ========= */
 /**
  * columns: Array<Float32Array> (dB)
  */
@@ -98,9 +95,9 @@ function drawSpectrogram(canvas, columns, opts) {
     const col = columns[x];
     for (let yy = 0; yy < height; yy++) {
       const y = ys + yy;
-      const db = col[y]; // 例: -100..0
-      const norm = clamp((db - minDb) * invRange, 0, 1); // 0..1
-      const ink = 255 - Math.floor(norm * 255); // 強いほど黒
+      const db = col[y];
+      const norm = clamp((db - minDb) * invRange, 0, 1);
+      const ink = 255 - Math.floor(norm * 255);
       const yFlip = (height - 1) - yy;
       const idx = (yFlip * width + x) * 4;
       data[idx + 0] = ink;
@@ -112,7 +109,7 @@ function drawSpectrogram(canvas, columns, opts) {
 
   ctx.putImageData(img, 0, 0);
 
-  // 薄ガイド線（時間方向）
+  // ガイド線（時間方向）
   ctx.save();
   ctx.globalAlpha = 0.18;
   ctx.strokeStyle = '#000000';
@@ -127,97 +124,7 @@ function drawSpectrogram(canvas, columns, opts) {
   ctx.restore();
 }
 
-/** ========== 5秒/3秒重複の区間スライス ========== */
-function makeSliceBlob(file, startSec, durationSec, bytesPerSec, padBytes) {
-  const startByte = Math.max(0, Math.floor(startSec * bytesPerSec) - padBytes);
-  const endByte = Math.min(file.size, Math.floor((startSec + durationSec) * bytesPerSec) + padBytes);
-  return file.slice(startByte, endByte);
-}
-
-/** ========== 解析: slice Blob を無音再生しながら dB を取得 ========== */
-async function analyzeFromBlob(blob, targetSeconds, fftSize, fps, dbRange, abortSignal) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('audio');
-  a.src = url;
-  a.preload = 'auto';
-  a.muted = true;
-
-  await new Promise((resolve, reject) => {
-    const ok = () => { cleanup(); resolve(); };
-    const ng = () => { cleanup(); reject(new Error('区間Blobのデコード/準備に失敗（境界/形式の可能性）')); };
-    const cleanup = () => {
-      a.removeEventListener('canplay', ok);
-      a.removeEventListener('error', ng);
-    };
-    a.addEventListener('canplay', ok, { once: true });
-    a.addEventListener('error', ng, { once: true });
-    a.load();
-  });
-
-  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const src = audioCtx.createMediaElementSource(a);
-
-  const analyser = audioCtx.createAnalyser();
-  analyser.fftSize = fftSize;
-  analyser.smoothingTimeConstant = 0;
-  analyser.minDecibels = dbRange.minDb;
-  analyser.maxDecibels = dbRange.maxDb;
-
-  const gain = audioCtx.createGain();
-  gain.gain.value = 0.0;
-
-  src.connect(analyser);
-  analyser.connect(gain);
-  gain.connect(audioCtx.destination);
-
-  const bins = analyser.frequencyBinCount;
-  const tmp = new Float32Array(bins);
-  const hopMs = 1000 / fps;
-  const columns = [];
-
-  let stopRequested = false;
-  const onAbort = () => { stopRequested = true; };
-  abortSignal?.addEventListener('abort', onAbort, { once: true });
-
-  try {
-    await a.play();
-
-    const startT = performance.now();
-    let nextSample = startT;
-
-    while (!stopRequested) {
-      const now = performance.now();
-      const elapsed = (now - startT) / 1000;
-      if (elapsed >= targetSeconds) break;
-
-      if (now >= nextSample) {
-        analyser.getFloatFrequencyData(tmp); // dB
-        columns.push(new Float32Array(tmp));
-        nextSample += hopMs;
-      }
-      await sleep(8);
-    }
-
-    a.pause();
-    if (columns.length === 0) {
-      analyser.getFloatFrequencyData(tmp);
-      columns.push(new Float32Array(tmp));
-    }
-
-    return { columns, sampleRate: audioCtx.sampleRate, fftSize, fps };
-  } finally {
-    abortSignal?.removeEventListener('abort', onAbort);
-    URL.revokeObjectURL(url);
-    try { a.pause(); } catch {}
-    try { a.src = ''; } catch {}
-    try { src.disconnect(); } catch {}
-    try { analyser.disconnect(); } catch {}
-    try { gain.disconnect(); } catch {}
-    try { await audioCtx.close(); } catch {}
-  }
-}
-
-/** ========== 解析: 元ファイルをシークして5秒だけ無音解析（MP3向け） ========== */
+/** ========= 解析用アナライザ（シーク方式） ========= */
 let analyzer = {
   url: null,
   audio: null,
@@ -229,7 +136,7 @@ let analyzer = {
 };
 
 async function initAnalyzerForFile(file) {
-  // URL
+  // URL更新
   if (analyzer.url) { try { URL.revokeObjectURL(analyzer.url); } catch {} }
   analyzer.url = URL.createObjectURL(file);
 
@@ -237,9 +144,10 @@ async function initAnalyzerForFile(file) {
   if (!analyzer.audio) analyzer.audio = document.createElement('audio');
   analyzer.audio.src = analyzer.url;
   analyzer.audio.preload = 'auto';
-  analyzer.audio.muted = true;
+  analyzer.audio.volume = 1.0; // ★ muted禁止（これが白紙の主因）
+  analyzer.audio.muted = false;
 
-  // canplay
+  // canplay待ち
   await new Promise((resolve, reject) => {
     const ok = () => { cleanup(); resolve(); };
     const ng = () => { cleanup(); reject(new Error('解析用audioの準備に失敗')); };
@@ -252,13 +160,13 @@ async function initAnalyzerForFile(file) {
     analyzer.audio.load();
   });
 
-  // WebAudio graph（1回だけ）
+  // WebAudio graph（初回のみ作成）
   if (!analyzer.audioCtx) {
     analyzer.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     analyzer.src = analyzer.audioCtx.createMediaElementSource(analyzer.audio);
     analyzer.analyser = analyzer.audioCtx.createAnalyser();
     analyzer.gain = analyzer.audioCtx.createGain();
-    analyzer.gain.gain.value = 0.0;
+    analyzer.gain.gain.value = 0.0; // ★ ここで無音化
     analyzer.src.connect(analyzer.analyser);
     analyzer.analyser.connect(analyzer.gain);
     analyzer.gain.connect(analyzer.audioCtx.destination);
@@ -270,7 +178,6 @@ async function initAnalyzerForFile(file) {
 async function analyzeBySeeking(startSec, targetSeconds, fftSize, fps, dbRange, abortSignal) {
   if (!analyzer.inited) throw new Error('analyzer未初期化');
 
-  // analyzer設定
   analyzer.analyser.fftSize = fftSize;
   analyzer.analyser.smoothingTimeConstant = 0;
   analyzer.analyser.minDecibels = dbRange.minDb;
@@ -287,7 +194,7 @@ async function analyzeBySeeking(startSec, targetSeconds, fftSize, fps, dbRange, 
 
   try {
     analyzer.audio.currentTime = Math.max(0, startSec);
-    await sleep(60); // シーク反映待ち
+    await sleep(80); // シーク反映待ち
 
     await analyzer.audio.play();
 
@@ -321,7 +228,7 @@ async function analyzeBySeeking(startSec, targetSeconds, fftSize, fps, dbRange, 
   }
 }
 
-/** ========== 再生（元ファイルをシークして5秒だけ） ========== */
+/** ========= 再生（元ファイルをシークして5秒だけ） ========= */
 let _segTimer = null;
 async function playSegmentFromFullAudio(startSec, endSec) {
   if (!UI.fullAudio.src) return;
@@ -341,7 +248,7 @@ async function playSegmentFromFullAudio(startSec, endSec) {
   }, ms + 30);
 }
 
-/** ========== カードUI ========== */
+/** ========= カードUI ========= */
 function addCard({ index, startSec, endSec, columns, sampleRate, fftSize, fps, band, dbRange }) {
   const card = document.createElement('div');
   card.className = 'card';
@@ -387,13 +294,10 @@ function addCard({ index, startSec, endSec, columns, sampleRate, fftSize, fps, b
   drawSpectrogram(canvas, columns, { yStart, yEnd, minDb: dbRange.minDb, maxDb: dbRange.maxDb });
 
   canvas.dataset.segIndex = String(index);
-  canvas.dataset.startSec = String(startSec);
-  canvas.dataset.endSec = String(endSec);
-
   UI.exportZipBtn.disabled = false;
 }
 
-/** ========== ZIP（STORE） ========== */
+/** ========= ZIP（STORE） ========= */
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let i = 0; i < 256; i++) {
@@ -482,7 +386,6 @@ function downloadBlob(blob, filename) {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
-
 async function canvasesToZip() {
   const canvases = Array.from(UI.cards.querySelectorAll('canvas'));
   if (canvases.length === 0) { alert('カードがありません'); return; }
@@ -522,7 +425,7 @@ async function canvasesToZip() {
   }
 }
 
-/** ========== 実行制御 ========== */
+/** ========= 実行制御 ========= */
 let abortCtrl = null;
 
 async function ensureFullAudioMetadata(file) {
@@ -544,12 +447,6 @@ async function ensureFullAudioMetadata(file) {
     UI.fullAudio.load();
   });
   return duration;
-}
-
-function isLikelyWav(file) {
-  const name = (file.name || '').toLowerCase();
-  const type = (file.type || '').toLowerCase();
-  return type.includes('wav') || name.endsWith('.wav');
 }
 
 function clearUI() {
@@ -604,19 +501,13 @@ UI.analyzeBtn.addEventListener('click', async () => {
     const bytesPerSec = file.size / duration;
     UI.bpsLabel.textContent = `${Math.floor(bytesPerSec).toLocaleString()} B/s`;
 
-    // MP3等はシーク解析へ
-    const useWavSlice = isLikelyWav(file);
-    if (useWavSlice) {
-      logLine('解析方式: slice（WAV想定）');
-    } else {
-      logLine('解析方式: シーク（MP3等は slice だと無音になりやすいので自動フォールバック）');
-      await initAnalyzerForFile(file);
-    }
+    // 解析用アナライザ初期化（ここが本体）
+    logLine('解析方式: シーク（全形式）');
+    await initAnalyzerForFile(file);
 
     const windowSec = 5.0;
     const overlapSec = 3.0;
     const stepSec = windowSec - overlapSec; // 2s
-    const padBytes = 256 * 1024; // slice用
 
     const totalSegments = Math.min(maxCards, Math.ceil(Math.max(0, duration - windowSec) / stepSec) + 1);
     logLine(`duration=${duration.toFixed(2)}s / セグメント上限=${totalSegments}`);
@@ -636,14 +527,7 @@ UI.analyzeBtn.addEventListener('click', async () => {
       UI.barFill.style.width = `${(i / totalSegments) * 100}%`;
 
       try {
-        let res;
-        if (useWavSlice) {
-          const blob = makeSliceBlob(file, startSec, windowSec, bytesPerSec, padBytes);
-          res = await analyzeFromBlob(blob, windowSec, fftSize, fps, dbRange, abortCtrl.signal);
-        } else {
-          res = await analyzeBySeeking(startSec, windowSec, fftSize, fps, dbRange, abortCtrl.signal);
-        }
-
+        const res = await analyzeBySeeking(startSec, windowSec, fftSize, fps, dbRange, abortCtrl.signal);
         addCard({
           index: i + 1,
           startSec, endSec,
