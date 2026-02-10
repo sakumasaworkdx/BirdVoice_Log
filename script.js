@@ -1,64 +1,30 @@
-const resultContainer = document.getElementById('resultContainer');
+const runBtn = document.getElementById('runBtn');
 const fileInput = document.getElementById('audioFile');
+const resultContainer = document.getElementById('resultContainer');
 const status = document.getElementById('status');
+let audioCtx, globalBuffer;
 
-fileInput.addEventListener('change', async (e) = {
-    const file = e.target.files[0];
-    if (!file) return;
+runBtn.addEventListener('click', async () => {
+const file = fileInput.files[0];
+if (!file) return;
+if (!audioCtx) audioCtx = new AudioContext();
+status.textContent = "解析中...";
+resultContainer.innerHTML = "";
+const arrayBuffer = await file.arrayBuffer();
+globalBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
-    status.textContent = 解析中...;
-    resultContainer.innerHTML = ;
-
-    const audioCtx = new (window.AudioContext  window.webkitAudioContext)();
-    const arrayBuffer = await file.arrayBuffer();
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-
-    const segmentDuration = 5;  5秒
-    const overlap = 3;          3秒重複
-    const step = segmentDuration - overlap;  次の開始位置までの歩進
-
-    for (let start = 0; start  audioBuffer.duration - overlap; start += step) {
-        createSpectrogram(audioBuffer, start, segmentDuration, audioCtx);
-    }
-    status.textContent = 解析完了;
 });
 
-async function createSpectrogram(buffer, startTime, duration, context) {
-    const segmentCanvas = document.createElement('canvas');
-    segmentCanvas.width = 600;
-    segmentCanvas.height = 300;
-    const ctx = segmentCanvas.getContext('2d');
-
-     オフラインコンテキストで高速解析
-    const offlineCtx = new OfflineAudioContext(1, context.sampleRate  duration, context.sampleRate);
-    const source = offlineCtx.createBufferSource();
-    source.buffer = buffer;
-
-    const analyser = offlineCtx.createAnalyser();
-    analyser.fftSize = 2048;  分解能
-    source.connect(analyser);
-    analyser.connect(offlineCtx.destination);
-
-    source.start(0, startTime, duration);
-
-     描画処理（簡易版ロジック）
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-    const sliceWidth = segmentCanvas.width  (duration  60);  1秒間を60フレームと想定
-
-    let x = 0;
-    source.onended = () = {
-         実際の実装ではレンダリング中に定期的にanalyser.getByteFrequencyDataを取得してCanvasに描画します
-    };
-
-    const wrapper = document.createElement('div');
-    wrapper.className = segment-wrapper;
-    wrapper.innerHTML = `h3${startTime.toFixed(1)}s - ${(startTime + duration).toFixed(1)}sh3`;
-    wrapper.appendChild(segmentCanvas);
-    resultContainer.appendChild(wrapper);
-    
-     ※実用コードではレンダリングのタイミング制御が必要ですが、まずは枠組みとして提示します。
-    offlineCtx.startRendering().then(renderedBuffer = {
-         レンダリング完了後の処理
-    });
+function drawSpec(canvas, start) {
+const ctx = canvas.getContext('2d');
+const data = globalBuffer.getChannelData(0);
+const sr = globalBuffer.sampleRate;
+const startIdx = Math.floor(start * sr);
+const w = canvas.width;
+const h = canvas.height;
+for (let i = 0; i < w; i++) {
+const v = Math.abs(data[startIdx + i * 100] || 0);
+ctx.fillStyle = "hsl(" + (240 - v * 500) + ", 100%, 50%)";
+ctx.fillRect(i, h - v * h * 5, 1, v * h * 5);
+}
 }
