@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>BirdVoice-Mini: Spectrum Analyzer</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>野鳥音声解析プロトタイプ</h1>
+    <p>WAVファイルを選択すると、5秒ごとに分割してスペクトログラムを生成します。</p>
+    
+    <div class="controls">
+        <input type="file" id="audioFile" accept="audio/wav,audio/mpeg">
+        <span id="status"></span>
+    </div>
+
+    <div id="resultContainer">
+        </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
