@@ -454,7 +454,7 @@ async function generateTileBitmap(tileIndex, cfg, abortSignal) {
   try {
     analyzer.audio.currentTime = Math.max(0, tileStart);
     await sleep(90);
-    await analyzer.audio.play();
+    try { await analyzer.audio.play(); } catch (e) { /* Chrome autoplay guard */ }
 
     const startT = nowMs();
     let nextSample = startT;
@@ -784,6 +784,10 @@ UI.prepareBtn.addEventListener('click', async () => {
     UI.durLabel.textContent = `${duration.toFixed(2)}s`;
 
     await initAnalyzerForFile(file);
+  if (analyzer.audioCtx && analyzer.audioCtx.state === 'suspended') {
+    try { await analyzer.audioCtx.resume(); } catch(e){}
+  }
+
 
     const cfg = getConfig();
     const totalW = Math.max(1, Math.floor(duration * cfg.pxPerSec));

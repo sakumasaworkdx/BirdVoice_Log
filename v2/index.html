@@ -3,17 +3,13 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>野鳥の鳴き声 解析・可視化（WaveTone風タイムライン）</title>
+  <title>野鳥の鳴き声 解析・可視化（WaveTone風タイムライン v2）</title>
   <style>
     :root{
       --bg:#0b1220;
-      --panel:#0f1b33;
       --text:#e8eefc;
       --muted:#a9b6d6;
       --line:rgba(255,255,255,.10);
-      --accent:#6ee7ff;
-      --accent2:#a78bfa;
-      --danger:#ff6b6b;
       --shadow: 0 10px 30px rgba(0,0,0,.35);
       --radius: 16px;
     }
@@ -27,20 +23,12 @@
       color:var(--text);
       min-height:100vh;
     }
-    header{
-      padding:24px 18px 12px;
-      max-width:1200px;
-      margin:0 auto;
-    }
+    header{padding:24px 18px 12px; max-width:1200px; margin:0 auto;}
     .title{display:flex; gap:12px; align-items:center; flex-wrap:wrap;}
     .badge{
-      font-size:12px;
-      padding:6px 10px;
-      border:1px solid var(--line);
-      border-radius:999px;
-      background:rgba(255,255,255,.05);
-      color:var(--muted);
-      white-space:nowrap;
+      font-size:12px; padding:6px 10px; border:1px solid var(--line);
+      border-radius:999px; background:rgba(255,255,255,.05);
+      color:var(--muted); white-space:nowrap;
     }
     h1{margin:0; font-size:20px; letter-spacing:.2px;}
     p{margin:10px 0 0; color:var(--muted); line-height:1.5; font-size:13px;}
@@ -58,35 +46,24 @@
     .row-right{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
     .field{
       display:flex; gap:8px; align-items:center; flex-wrap:wrap;
-      padding:10px 12px;
-      border:1px solid var(--line);
-      border-radius:12px;
-      background:rgba(0,0,0,.18);
+      padding:10px 12px; border:1px solid var(--line);
+      border-radius:12px; background:rgba(0,0,0,.18);
     }
     .field label{font-size:12px; color:var(--muted)}
     input[type="file"]{color:var(--muted)}
-    input[type="number"]{
-      width:88px;
-      padding:8px 10px;
-      border-radius:10px;
-      border:1px solid var(--line);
-      background:rgba(0,0,0,.25);
-      color:var(--text);
-      outline:none;
+    input[type="number"], select{
+      width:96px; padding:8px 10px; border-radius:10px;
+      border:1px solid var(--line); background:rgba(0,0,0,.25);
+      color:var(--text); outline:none;
     }
+    select{width:auto; max-width:220px;}
+    input[type="checkbox"]{transform:scale(1.1)}
     button{
-      appearance:none;
-      border:1px solid var(--line);
+      appearance:none; border:1px solid var(--line);
       background: linear-gradient(180deg, rgba(110,231,255,.18), rgba(110,231,255,.06));
-      color:var(--text);
-      padding:10px 12px;
-      border-radius:12px;
-      cursor:pointer;
-      transition: transform .06s ease, filter .12s ease, opacity .12s ease;
-      font-weight:700;
-      letter-spacing:.2px;
-      font-size:13px;
-      white-space:nowrap;
+      color:var(--text); padding:10px 12px; border-radius:12px;
+      cursor:pointer; transition: transform .06s ease, filter .12s ease, opacity .12s ease;
+      font-weight:700; letter-spacing:.2px; font-size:13px; white-space:nowrap;
     }
     button:hover{filter:brightness(1.08)}
     button:active{transform:translateY(1px)}
@@ -108,46 +85,32 @@
       max-height:220px; overflow:auto;
     }
 
-    /* timeline */
     .timeline-wrap{
-      margin-top:14px;
-      border:1px solid var(--line);
-      border-radius: var(--radius);
-      background: rgba(0,0,0,.18);
-      box-shadow: var(--shadow);
-      overflow:hidden;
+      margin-top:14px; border:1px solid var(--line);
+      border-radius: var(--radius); background: rgba(0,0,0,.18);
+      box-shadow: var(--shadow); overflow:hidden;
     }
     .timeline-toolbar{
       display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between;
-      padding:10px 12px;
-      border-bottom:1px solid var(--line);
+      padding:10px 12px; border-bottom:1px solid var(--line);
       background: rgba(0,0,0,.10);
     }
     .timeline-toolbar .left{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
     .viewport{
       position:relative;
-      height: 360px;
+      height: 380px;
       overflow:auto;
       background:#0b0f1c;
     }
-    .spacer{
-      height:100%;
-    }
+    .spacer{height:100%;}
     canvas#specCanvas{
-      position:sticky;
-      left:0;
-      top:0;
-      display:block;
-      width:100%;
-      height:100%;
+      position:sticky; left:0; top:0;
+      display:block; width:100%; height:100%;
       background:#ffffff;
     }
     .hint{
-      padding:10px 12px;
-      border-top:1px solid var(--line);
-      color:var(--muted);
-      font-size:12px;
-      line-height:1.5;
+      padding:10px 12px; border-top:1px solid var(--line);
+      color:var(--muted); font-size:12px; line-height:1.5;
       background: rgba(0,0,0,.10);
     }
   </style>
@@ -155,11 +118,12 @@
 <body>
   <header>
     <div class="title">
-      <h1>野鳥の鳴き声 解析・可視化（WaveTone風タイムライン）</h1>
-      <span class="badge">シームレス時間軸</span>
-      <span class="badge">再生カーソル</span>
-      <span class="badge">クリック再生</span>
-      <span class="badge">ビューポートのみ描画</span>
+      <h1>野鳥の鳴き声 解析・可視化（WaveTone風タイムライン v2）</h1>
+      <span class="badge">色マップ</span>
+      <span class="badge">対数周波数</span>
+      <span class="badge">鳥声帯域強調</span>
+      <span class="badge">PNG書き出し</span>
+      <span class="badge">ビューポートのみ解析</span>
     </div>
     <p>
       巨大ファイルでも「表示中の範囲」だけを動的に解析・描画します（タイル方式＋LRUキャッシュ）。<br/>
@@ -173,7 +137,7 @@
         <div class="row">
           <div class="row-left">
             <div class="field">
-              <label>音声ファイル</label>
+              <label>音声</label>
               <input id="fileInput" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg" />
             </div>
 
@@ -186,22 +150,20 @@
             <div class="field">
               <label>解析FPS</label>
               <input id="fps" type="number" min="10" max="120" step="1" value="60" />
-              <span class="pill">列密度</span>
             </div>
 
             <div class="field">
-              <label>表示帯域(Hz)</label>
+              <label>帯域(Hz)</label>
               <input id="minHz" type="number" min="0" max="20000" step="100" value="2000" />
               <span class="pill">〜</span>
-              <input id="maxHz" type="number" min="0" max="24000" step="100" value="10000" />
+              <input id="maxHz" type="number" min="0" max="24000" step="100" value="12000" />
             </div>
 
             <div class="field">
               <label>dB</label>
-              <input id="minDb" type="number" min="-120" max="-10" step="1" value="-90" />
+              <input id="minDb" type="number" min="-120" max="-10" step="1" value="-100" />
               <span class="pill">〜</span>
-              <input id="maxDb" type="number" min="-120" max="0" step="1" value="-20" />
-              <span class="pill">濃淡</span>
+              <input id="maxDb" type="number" min="-120" max="0" step="1" value="-25" />
             </div>
 
             <div class="field">
@@ -210,14 +172,40 @@
             </div>
 
             <div class="field">
-              <label>タイル秒数</label>
+              <label>タイル秒</label>
               <input id="tileSec" type="number" min="2" max="20" step="1" value="5" />
-              <span class="pill">動的解析単位</span>
             </div>
 
             <div class="field">
-              <label>キャッシュ数</label>
+              <label>キャッシュ</label>
               <input id="cacheTiles" type="number" min="10" max="300" step="10" value="80" />
+            </div>
+
+            <div class="field">
+              <label>色</label>
+              <select id="colorMap">
+                <option value="turbo" selected>Turbo</option>
+                <option value="magma">Magma</option>
+                <option value="viridis">Viridis</option>
+                <option value="grayscale">Grayscale</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label>周波数軸</label>
+              <select id="freqScale">
+                <option value="log" selected>log</option>
+                <option value="linear">linear</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label>帯域強調</label>
+              <input id="bandHighlight" type="checkbox" checked />
+              <span class="pill">鳥声</span>
+              <input id="birdMinHz" type="number" min="0" max="24000" step="100" value="2500" />
+              <span class="pill">〜</span>
+              <input id="birdMaxHz" type="number" min="0" max="24000" step="100" value="9000" />
             </div>
           </div>
 
@@ -226,6 +214,7 @@
             <button id="playBtn" class="secondary" disabled>再生</button>
             <button id="pauseBtn" class="secondary" disabled>一時停止</button>
             <button id="stopBtn" class="danger" disabled>停止</button>
+            <button id="exportViewBtn" class="secondary" disabled>PNG保存（表示中）</button>
             <button id="clearBtn" class="secondary">クリア</button>
           </div>
         </div>
@@ -235,7 +224,7 @@
         <div class="bar"><div id="barFill"></div></div>
         <div class="meta">
           <div>
-            <span class="pill">ファイル長: <strong id="durLabel">-</strong></span>
+            <span class="pill">長さ: <strong id="durLabel">-</strong></span>
             <span class="pill">状態: <strong id="stateLabel">待機</strong></span>
             <span class="pill">表示: <strong id="viewLabel">-</strong></span>
           </div>
@@ -251,11 +240,11 @@
     <section class="timeline-wrap">
       <div class="timeline-toolbar">
         <div class="left">
-          <span class="pill">操作: クリックでシーク / スクロールで移動</span>
-          <span class="pill">自動スクロール: 再生中は赤線が画面外に行きそうなら追従</span>
+          <span class="pill">クリックでシーク / スクロールで移動 / 赤線=再生位置</span>
+          <span class="pill">再生中は赤線に追従</span>
         </div>
         <div>
-          <span class="pill mono">kHz目盛り表示</span>
+          <span class="pill mono">kHz目盛り + グリッド</span>
         </div>
       </div>
 
@@ -265,13 +254,12 @@
       </div>
 
       <div class="hint">
-        ※「白っぽい」→ <span class="mono">minDb</span>を下げる（例 -100） / 「濃すぎ」→ <span class="mono">maxDb</span>を下げる（例 -30）<br/>
-        ※ 2GB以上のファイルでも、表示範囲のタイルだけ解析して描画するためメモリが増えにくい設計です。
+        「薄い」→ <span class="mono">minDb</span>を下げる（例 -110） / 「濃すぎ」→ <span class="mono">maxDb</span>を下げる（例 -35）<br/>
+        タイル秒を小さくするとスクロール時の追従が軽くなります（ただし解析回数は増えます）。
       </div>
     </section>
 
     <audio id="fullAudio" controls style="width:100%; margin-top:14px; display:none;"></audio>
-
   </main>
 
   <script src="./script.js"></script>
