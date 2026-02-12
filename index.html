@@ -244,7 +244,7 @@
       <span class="badge">5秒分割 / 3秒重複</span>
       <span class="badge">dB表示（論文風）</span>
       <span class="badge">PNG一括(ZIP)</span>
-      <span class="badge">v4: mute修正/seek解析</span>
+      <span class="badge">v3: dBデータ修正</span>
     </div>
     <p>
       <span class="mono">file.slice()</span> で必要区間Blobだけを順次解析（巨大ファイルでもクラッシュしにくい）。<br/>
@@ -273,6 +273,19 @@
               <label>解析FPS</label>
               <input id="fps" type="number" min="10" max="120" step="1" value="60" />
             </div>
+
+            <div class="field">
+              <label>区間秒数</label>
+              <input id="windowSec" type="number" min="0.5" max="60" step="0.5" value="5" />
+              <span class="pill">例: 5</span>
+            </div>
+
+            <div class="field">
+              <label>重複秒数</label>
+              <input id="overlapSec" type="number" min="0" max="59.5" step="0.5" value="3" />
+              <span class="pill">例: 3</span>
+            </div>
+
 
             <div class="field">
               <label>帯域(Hz)</label>
