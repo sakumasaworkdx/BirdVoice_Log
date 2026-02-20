@@ -1497,14 +1497,24 @@ async function scanBandDecode(file){
 
 
 async function scanBand(file){
+  // IMPORTANT:
+  // - WAV以外(例: MP3/M4A/OGG)は readWavHeader を呼ばず decode方式へ直行
+  // - WAVでもヘッダ/切れ目で失敗したら decode方式へフォールバックして完走を優先
+  const name = (file?.name || '').toLowerCase();
+  const type = (file?.type || '').toLowerCase();
+  const isWav = type.includes('wav') || name.endsWith('.wav') || name.endsWith('.wave');
+
   try{
-    // WAV header check; if fails, fall back to decode方式（MP3等）
-    try{
-      await readWavHeader(file);
-      await scanBandWav(file);
-    } catch(e){
-      await scanBandDecode(file);
+    if (isWav){
+      try{
+        await scanBandWav(file);
+        return;
+      } catch(e){
+        // WAVとして扱ったが失敗 -> decode方式へ切替
+        logLine(`WAV解析失敗→decode方式へ切替: ${e?.message ?? e}`);
+      }
     }
+    await scanBandDecode(file);
   } finally {
     UI.scanBtn.disabled = false;
     UI.scanAbortBtn.disabled = true;
