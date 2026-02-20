@@ -1507,7 +1507,7 @@ async function scanBand(file){
   try{
     if (isWav){
       try{
-        await scanBandWav(file);
+        await scanBand(file);
         return;
       } catch(e){
         // WAVとして扱ったが失敗 -> decode方式へ切替
@@ -1529,7 +1529,7 @@ UI.scanBtn.addEventListener('click', async () => {
   if (!file) { alert('音声ファイルを選択してください'); return; }
 
   try {
-    await scanBandWav(file);
+    await scanBand(file);
   } catch (e) {
     const msg = e?.message ?? String(e);
     logLine(`スキャン停止: ${msg}`);
