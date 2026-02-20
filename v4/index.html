@@ -254,26 +254,45 @@
         <div class="card">
           <div class="card-title">帯域スキャン（巨大WAV向け / 5秒単位）</div>
           <div class="note">
-            ※ file.slice() でPCM領域を直接読み出す方式のため、現状は <b>WAV（PCM/Float）</b> のみ対応です。
+            ※ MP3/WAV等に対応（file.slice() → decodeAudioData → FFT解析）。MP3は圧縮の都合で分割境界で decode 失敗する場合がありますが、そのセグメントはスキップして継続します。
           </div>
 
           <div class="grid3">
             <div class="field">
               <label>最小周波数 (Hz)</label>
               <input id="scanMinHz" type="range" min="0" max="24000" step="10" value="2000"/>
-              <div class="hint mono"><span id="scanMinHzVal">2000</span> Hz</div>
+              <div class="hint mono"><input id="scanMinHzVal" type="number" min="0" max="24000" step="10" value="2000" /> Hz</div>
             </div>
             <div class="field">
               <label>最大周波数 (Hz)</label>
               <input id="scanMaxHz" type="range" min="0" max="24000" step="10" value="8000"/>
-              <div class="hint mono"><span id="scanMaxHzVal">8000</span> Hz</div>
+              <div class="hint mono"><input id="scanMaxHzVal" type="number" min="0" max="24000" step="10" value="8000" /> Hz</div>
             </div>
             <div class="field">
               <label>検出感度（ノイズからの浮き上がり dB）</label>
               <input id="scanThreshold" type="range" min="0" max="40" step="1" value="15"/>
-              <div class="hint mono"><span id="scanThresholdVal">-45</span> dB</div>
+              <div class="hint mono"><input id="scanThresholdVal" type="number" min="0" max="40" step="1" value="15" /> dB</div>
+              <div class="note mono">例：背景より <b>15dB</b> 大きい瞬間を検出</div>
             </div>
           </div>
+          <div class="row" style="margin-top:10px">
+            <span class="pill mono">解析プリセット</span>
+            <button id="presetNight" class="ghost" type="button">夜間汎用</button>
+            <button id="presetOwl" class="ghost" type="button">フクロウ</button>
+            <button id="presetTora" class="ghost" type="button">トラツグミ</button>
+            <div class="flex-grow"></div>
+          </div>
+
+          <div class="row" style="margin-top:10px">
+            <span class="pill mono">背景ノイズ学習範囲(秒)</span>
+            <label class="mono">開始</label>
+            <input id="noiseStartSec" type="number" min="0" step="0.1" value="5" />
+            <label class="mono">終了</label>
+            <input id="noiseEndSec" type="number" min="0" step="0.1" value="7" />
+            <span class="pill mono">（この区間を背景ノイズとして学習）</span>
+            <div class="flex-grow"></div>
+          </div>
+
 
           <div class="row">
             <button id="scanBtn" class="primary" disabled>全時間スキャン開始</button>

@@ -37,6 +37,9 @@ const UI = {
   scanMinHzVal: document.getElementById('scanMinHzVal'),
   scanMaxHzVal: document.getElementById('scanMaxHzVal'),
   scanThresholdVal: document.getElementById('scanThresholdVal'),
+  presetNight: document.getElementById('presetNight'),
+  presetOwl: document.getElementById('presetOwl'),
+  presetTora: document.getElementById('presetTora'),
   noiseStartSec: document.getElementById('noiseStartSec'),
   noiseEndSec: document.getElementById('noiseEndSec'),
   scanBtn: document.getElementById('scanBtn'),
@@ -927,23 +930,69 @@ function addDetectButton(sec){
 }
 
 function wireScanSliders(){
-  const sync = () => {
-    const min = parseInt(UI.scanMinHz.value,10)||0;
-    const max = parseInt(UI.scanMaxHz.value,10)||0;
-    const thr = parseInt(UI.scanThreshold.value,10)||-60;
-    UI.scanMinHzVal.textContent = String(min);
-    UI.scanMaxHzVal.textContent = String(max);
-    UI.scanThresholdVal.textContent = String(thr);
-    // keep min<=max
-    if (min > max) {
-      UI.scanMaxHz.value = UI.scanMinHz.value;
-      UI.scanMaxHzVal.textContent = UI.scanMinHzVal.textContent;
-    }
+  const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  const syncAll = () => {
+    let min = parseInt(UI.scanMinHz.value,10);
+    let max = parseInt(UI.scanMaxHz.value,10);
+    let thr = parseInt(UI.scanThreshold.value,10);
+    if (!Number.isFinite(min)) min = 0;
+    if (!Number.isFinite(max)) max = 0;
+    if (!Number.isFinite(thr)) thr = 15;
+
+    min = clampNum(min, 0, 24000);
+    max = clampNum(max, 0, 24000);
+    if (min > max) max = min;
+
+    thr = clampNum(thr, 0, 40);
+
+    UI.scanMinHz.value = String(min);
+    UI.scanMaxHz.value = String(max);
+    UI.scanThreshold.value = String(thr);
+
+    // number inputs
+    if (UI.scanMinHzVal) UI.scanMinHzVal.value = String(min);
+    if (UI.scanMaxHzVal) UI.scanMaxHzVal.value = String(max);
+    if (UI.scanThresholdVal) UI.scanThresholdVal.value = String(thr);
   };
-  UI.scanMinHz.addEventListener('input', sync);
-  UI.scanMaxHz.addEventListener('input', sync);
-  UI.scanThreshold.addEventListener('input', sync);
-  sync();
+
+  // range -> number
+  UI.scanMinHz.addEventListener('input', syncAll);
+  UI.scanMaxHz.addEventListener('input', syncAll);
+  UI.scanThreshold.addEventListener('input', syncAll);
+
+  // number -> range
+  UI.scanMinHzVal?.addEventListener('input', () => {
+    const v = parseInt(UI.scanMinHzVal.value,10);
+    if (!Number.isFinite(v)) return;
+    UI.scanMinHz.value = String(v);
+    syncAll();
+  });
+  UI.scanMaxHzVal?.addEventListener('input', () => {
+    const v = parseInt(UI.scanMaxHzVal.value,10);
+    if (!Number.isFinite(v)) return;
+    UI.scanMaxHz.value = String(v);
+    syncAll();
+  });
+  UI.scanThresholdVal?.addEventListener('input', () => {
+    const v = parseInt(UI.scanThresholdVal.value,10);
+    if (!Number.isFinite(v)) return;
+    UI.scanThreshold.value = String(v);
+    syncAll();
+  });
+
+  // presets (delta dB)
+  const setPreset = (min, max, thrDelta) => {
+    UI.scanMinHz.value = String(min);
+    UI.scanMaxHz.value = String(max);
+    UI.scanThreshold.value = String(thrDelta);
+    syncAll();
+  };
+  UI.presetNight?.addEventListener('click', () => setPreset(800, 4000, 10));
+  UI.presetOwl?.addEventListener('click', () => setPreset(400, 1200, 12));
+  UI.presetTora?.addEventListener('click', () => setPreset(2000, 2800, 15));
+
+  syncAll();
 }
 
 async function readWavHeader(file){
@@ -1097,7 +1146,6 @@ async function scanBandWav(file){
   const segBytes = Math.floor(bytesPerSec * SEG_SEC);
   const totalSeg = Math.ceil(header.dataSize / segBytes);
 
-  // FFT config (fixed, fast)
   const FFT_N = 2048;
   const plan = makeFft(FFT_N);
   const re = new Float32Array(FFT_N);
@@ -1105,7 +1153,7 @@ async function scanBandWav(file){
 
   const minHz = clamp(parseInt(UI.scanMinHz.value,10)||0, 0, header.sampleRate/2);
   const maxHz = clamp(parseInt(UI.scanMaxHz.value,10)||0, 0, header.sampleRate/2);
-  const thrDb = parseInt(UI.scanThreshold.value,10) || -60;
+  const thrDeltaDb = clamp(parseInt(UI.scanThreshold.value,10)||15, 0, 40);
   const lo = Math.min(minHz, maxHz);
   const hi = Math.max(minHz, maxHz);
 
@@ -1113,27 +1161,60 @@ async function scanBandWav(file){
   const minBin = clamp(Math.floor(lo / binHz), 0, FFT_N/2);
   const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
 
-  
-  // ===== 背景ノイズ学習（指定区間） =====
-  const noiseRange = parseNoiseRange(Number.isFinite(analyzer.duration) ? analyzer.duration : (header.dataSize / bytesPerSec));
-  const noiseStartByte = header.dataOffset + Math.floor(noiseRange.start * bytesPerSec);
-  const noiseEndByte = Math.min(header.dataOffset + header.dataSize, header.dataOffset + Math.floor(noiseRange.end * bytesPerSec));
+  // ---- noise learn (seconds range) ----
   let noiseFloorDb = -120;
   try{
-    const noiseAb = await file.slice(noiseStartByte, noiseEndByte).arrayBuffer();
-    const noiseMono = pcmBufferToMonoFloat32(noiseAb, header);
-    const np = buildNoiseProfileFromMono(noiseMono, header.sampleRate, FFT_N, plan, re, im, minBin, maxBin);
-    noiseFloorDb = np.noiseFloorDb;
-    logLine(`ノイズ学習: ${noiseRange.start.toFixed(1)}s〜${noiseRange.end.toFixed(1)}s / floor≈${noiseFloorDb.toFixed(1)} dB`);
+    const ns = parseFloat(UI.noiseStartSec?.value ?? '5');
+    const ne = parseFloat(UI.noiseEndSec?.value ?? '7');
+    let startSec = Number.isFinite(ns) ? ns : 5;
+    let endSec = Number.isFinite(ne) ? ne : 7;
+    startSec = Math.max(0, startSec);
+    endSec = Math.max(0, endSec);
+    if (endSec < startSec) { const t=startSec; startSec=endSec; endSec=t; }
+    if (endSec - startSec < 0.2) endSec = startSec + 0.2;
+
+    const startByte = header.dataOffset + Math.floor(startSec * bytesPerSec);
+    const endByte = Math.min(header.dataOffset + header.dataSize, header.dataOffset + Math.floor(endSec * bytesPerSec));
+    const nab = await file.slice(startByte, endByte).arrayBuffer();
+    const monoN = decodePcmMono(nab, header);
+
+    const hopN = FFT_N >> 1;
+    const bins = (maxBin - minBin + 1);
+    const acc = new Float64Array(bins);
+    let framesN = 0;
+
+    for (let i=0; i + FFT_N <= monoN.length; i += hopN){
+      for (let n=0;n<FFT_N;n++){
+        re[n] = monoN[i+n] * hannWindow(n, FFT_N);
+        im[n] = 0;
+      }
+      fftInPlace(re, im, plan);
+      for (let b=minBin; b<=maxBin; b++){
+        const rr = re[b], ii = im[b];
+        acc[b-minBin] += rr*rr + ii*ii;
+      }
+      framesN++;
+    }
+
+    let noiseFloorPow = 0;
+    if (framesN > 0){
+      for (let k=0;k<bins;k++){
+        const mean = acc[k] / framesN;
+        if (mean > noiseFloorPow) noiseFloorPow = mean;
+      }
+      noiseFloorDb = 10 * Math.log10(noiseFloorPow + 1e-12);
+    }
+    logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / floor≈${noiseFloorDb.toFixed(1)} dB`);
   } catch(e){
     logLine(`ノイズ学習失敗（継続）: ${e?.message ?? e}`);
     noiseFloorDb = -120;
   }
-logLine(`スキャン開始: WAV ${header.sampleRate}Hz ch=${header.numChannels} bits=${header.bitsPerSample} / SEG=5s / FFT=${FFT_N}`);
-  logLine(`帯域: ${lo}..${hi} Hz / しきい値: ${thrDb} dB`);
 
-  let lastDetectedBucket = -9999; // 5s bucket index
-  let detects = 0;
+  logLine(`スキャン開始: WAV ${header.sampleRate}Hz ch=${header.numChannels} bits=${header.bitsPerSample} / SEG=5s / FFT=${FFT_N}`);
+  logLine(`帯域: ${lo}..${hi} Hz / 検出感度(差分): +${thrDeltaDb} dB`);
+  logLine(`判定: 5秒内で1フレームでも (frameDb - noiseFloorDb) > +thr`);
+
+  let lastDetectedBucket = -9999;
 
   for (let seg=0; seg<totalSeg; seg++){
     if (sig.aborted) throw new Error('スキャン中断');
@@ -1146,53 +1227,222 @@ logLine(`スキャン開始: WAV ${header.sampleRate}Hz ch=${header.numChannels}
     const ab = await file.slice(sliceStart, sliceEnd).arrayBuffer();
     const mono = decodePcmMono(ab, header);
 
-    // STFT over this segment
     const hop = FFT_N >> 1;
-    let acc = 0;
-    let frames = 0;
+    let detected = false;
 
     for (let i=0; i + FFT_N <= mono.length; i += hop){
-      // window + copy
       for (let n=0;n<FFT_N;n++){
         re[n] = mono[i+n] * hannWindow(n, FFT_N);
         im[n] = 0;
       }
       fftInPlace(re, im, plan);
 
-      let bandPow = 0;
+      let frameMaxPow = 0;
       for (let b=minBin; b<=maxBin; b++){
         const rr = re[b], ii = im[b];
-        bandPow += rr*rr + ii*ii;
+        const p = rr*rr + ii*ii;
+        if (p > frameMaxPow) frameMaxPow = p;
       }
-      acc += bandPow;
-      frames++;
+      const frameDb = 10 * Math.log10(frameMaxPow + 1e-12);
+      if ((frameDb - noiseFloorDb) > thrDeltaDb){
+        detected = true;
+        break;
+      }
       if (sig.aborted) break;
     }
 
-    // Convert to dB (relative)
-    const meanPow = frames ? (acc / frames) : 0;
-    const db = 10 * Math.log10(meanPow + 1e-12);
+    setScanProgress(((seg+1)/totalSeg)*100);
 
-    const pct = ((seg+1)/totalSeg)*100;
-    setScanProgress(pct);
-
-    // detect, bucketed per 5s (seg itself)
-    if (db >= thrDb){
-      const bucket = seg; // already 5s
+    if (detected){
+      const bucket = seg;
       if (bucket !== lastDetectedBucket){
         lastDetectedBucket = bucket;
-        const sec = bucket * SEG_SEC;
-        addDetectButton(sec);
-        detects++;
+        addDetectButton(bucket * SEG_SEC);
       }
     }
 
-    // Yield to UI every segment
     await sleep(0);
   }
+}
 
-  logLine(`スキャン完了: 検出 ${detects} 件`);
-  setState('準備完了');
+async function scanBandDecode(file){
+  // MP3/AAC/OGG等: slice → decodeAudioData → FFT判定
+  const SEG_SEC = 5;
+  const OVERLAP_SEC = 0.25;
+
+  setState('スキャン中');
+  UI.scanBtn.disabled = true;
+  UI.scanAbortBtn.disabled = false;
+  clearDetectList();
+  setScanProgress(0);
+
+  scanAbortCtrl = new AbortController();
+  const sig = scanAbortCtrl.signal;
+
+  const duration = analyzer.duration || await ensureFullAudioMetadata(file);
+  if (!Number.isFinite(duration) || duration <= 0) throw new Error('duration取得に失敗');
+
+  const totalSeg = Math.ceil(duration / SEG_SEC);
+
+  const bytesPerSecEst = file.size / duration;
+  const segBytes = Math.max(256*1024, Math.floor(bytesPerSecEst * SEG_SEC));
+  const overlapBytes = Math.floor(bytesPerSecEst * OVERLAP_SEC);
+
+  const FFT_N = 2048;
+  const plan = makeFft(FFT_N);
+  const re = new Float32Array(FFT_N);
+  const im = new Float32Array(FFT_N);
+
+  const minHz = clamp(parseInt(UI.scanMinHz.value,10)||0, 0, 24000);
+  const maxHz = clamp(parseInt(UI.scanMaxHz.value,10)||0, 0, 24000);
+  const thrDeltaDb = clamp(parseInt(UI.scanThreshold.value,10)||15, 0, 40);
+  const lo = Math.min(minHz, maxHz);
+  const hi = Math.max(minHz, maxHz);
+
+  if (!analyzer.audioCtx) analyzer.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const audioCtx = analyzer.audioCtx;
+  if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch {} }
+
+  // ---- noise learn (decode) ----
+  let noiseFloorDb = -120;
+  try{
+    const ns = parseFloat(UI.noiseStartSec?.value ?? '5');
+    const ne = parseFloat(UI.noiseEndSec?.value ?? '7');
+    let startSec = Number.isFinite(ns) ? ns : 5;
+    let endSec = Number.isFinite(ne) ? ne : 7;
+    startSec = Math.max(0, startSec);
+    endSec = Math.max(0, endSec);
+    if (endSec < startSec) { const t=startSec; startSec=endSec; endSec=t; }
+    if (endSec - startSec < 0.2) endSec = startSec + 0.2;
+
+    const startByte = Math.max(0, Math.floor(startSec * bytesPerSecEst) - overlapBytes);
+    const endByte = Math.min(file.size, Math.floor(endSec * bytesPerSecEst) + overlapBytes);
+    const nab = await file.slice(startByte, endByte).arrayBuffer();
+    const nbuf = await audioCtx.decodeAudioData(nab);
+    const sr = nbuf.sampleRate;
+    const monoN = nbuf.getChannelData(0);
+
+    const binHz = sr / FFT_N;
+    const minBin = clamp(Math.floor(lo / binHz), 0, FFT_N/2);
+    const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
+
+    const hopN = FFT_N >> 1;
+    const bins = (maxBin - minBin + 1);
+    const acc = new Float64Array(bins);
+    let framesN = 0;
+
+    for (let i=0; i + FFT_N <= monoN.length; i += hopN){
+      for (let n=0;n<FFT_N;n++){
+        re[n] = monoN[i+n] * hannWindow(n, FFT_N);
+        im[n] = 0;
+      }
+      fftInPlace(re, im, plan);
+      for (let b=minBin; b<=maxBin; b++){
+        const rr = re[b], ii = im[b];
+        acc[b-minBin] += rr*rr + ii*ii;
+      }
+      framesN++;
+    }
+
+    let noiseFloorPow = 0;
+    if (framesN > 0){
+      for (let k=0;k<bins;k++){
+        const mean = acc[k] / framesN;
+        if (mean > noiseFloorPow) noiseFloorPow = mean;
+      }
+      noiseFloorDb = 10 * Math.log10(noiseFloorPow + 1e-12);
+    }
+    logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / floor≈${noiseFloorDb.toFixed(1)} dB`);
+  } catch(e){
+    console.warn('ノイズ学習失敗（継続）', e);
+    logLine(`ノイズ学習失敗（継続）: ${e?.message ?? e}`);
+    noiseFloorDb = -120;
+  }
+
+  logLine(`スキャン開始: decode方式 / duration≈${duration.toFixed(2)}s / SEG=5s / FFT=${FFT_N}`);
+  logLine(`帯域: ${lo}..${hi} Hz / 検出感度(差分): +${thrDeltaDb} dB`);
+  logLine(`判定: 5秒内で1フレームでも (frameDb - noiseFloorDb) > +thr`);
+
+  let lastDetectedBucket = -9999;
+
+  for (let seg=0; seg<totalSeg; seg++){
+    if (sig.aborted) throw new Error('スキャン中断');
+
+    const segStartSec = seg * SEG_SEC;
+    const startByte = Math.max(0, Math.floor(segStartSec * bytesPerSecEst) - overlapBytes);
+    const endByte = Math.min(file.size, startByte + segBytes + overlapBytes);
+
+    let arrayBuf = null;
+
+    try{
+      arrayBuf = await file.slice(startByte, endByte).arrayBuffer();
+      const audioBuf = await audioCtx.decodeAudioData(arrayBuf);
+      const sr = audioBuf.sampleRate;
+      const mono = audioBuf.getChannelData(0);
+
+      const binHz = sr / FFT_N;
+      const minBin = clamp(Math.floor(lo / binHz), 0, FFT_N/2);
+      const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
+
+      const hop = FFT_N >> 1;
+      let detected = false;
+
+      for (let i=0; i + FFT_N <= mono.length; i += hop){
+        for (let n=0;n<FFT_N;n++){
+          re[n] = mono[i+n] * hannWindow(n, FFT_N);
+          im[n] = 0;
+        }
+        fftInPlace(re, im, plan);
+
+        let frameMaxPow = 0;
+        for (let b=minBin; b<=maxBin; b++){
+          const rr = re[b], ii = im[b];
+          const p = rr*rr + ii*ii;
+          if (p > frameMaxPow) frameMaxPow = p;
+        }
+        const frameDb = 10 * Math.log10(frameMaxPow + 1e-12);
+        if ((frameDb - noiseFloorDb) > thrDeltaDb){
+          detected = true;
+          break;
+        }
+        if (sig.aborted) break;
+      }
+
+      if (detected){
+        const bucket = seg;
+        if (bucket !== lastDetectedBucket){
+          lastDetectedBucket = bucket;
+          addDetectButton(bucket * SEG_SEC);
+        }
+      }
+    } catch(e){
+      console.warn('デコード失敗、スキップします', e);
+      logLine(`seg#${seg} decode失敗（skip）: ${e?.message ?? e}`);
+    } finally {
+      arrayBuf = null;
+    }
+
+    setScanProgress(((seg+1)/totalSeg)*100);
+    await sleep(0);
+  }
+}
+
+async function scanBand(file){
+  try{
+    // WAV header check; if fails, fall back to decode方式（MP3等）
+    try{
+      await readWavHeader(file);
+      await scanBand(file);
+    } catch(e){
+      await scanBandDecode(file);
+    }
+  } finally {
+    UI.scanBtn.disabled = false;
+    UI.scanAbortBtn.disabled = true;
+    scanAbortCtrl = null;
+    setState('準備完了');
+    setScanProgress(0);
+  }
 }
 
 UI.scanBtn.addEventListener('click', async () => {
@@ -1200,7 +1450,7 @@ UI.scanBtn.addEventListener('click', async () => {
   if (!file) { alert('音声ファイルを選択してください'); return; }
 
   try {
-    await scanBandWav(file);
+    await scanBand(file);
   } catch (e) {
     const msg = e?.message ?? String(e);
     logLine(`スキャン停止: ${msg}`);
