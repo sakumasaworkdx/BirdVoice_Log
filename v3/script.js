@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * v2.5.6
+ * v2.5.7
  * - 読み込み/準備が反応しない原因のほとんどは「index.html と script.js の不一致」です。
  *   このスクリプトは、要素が無い場合でも落ちないようにガードしてあります。
  */
@@ -1210,5 +1210,5 @@ function wire(){
 
 wire();
 window.__diagClick = () => { logLine('diag: clicked'); try{ runDiagnostics(); } catch(e){ logLine('diag: exception ' + (e?.message ?? e)); } };
-logLine('[boot] v2.5.6 loaded');
+logLine('[boot] v2.5.7 loaded (1771579762)');
 clearAll();
