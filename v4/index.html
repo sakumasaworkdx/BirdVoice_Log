@@ -252,44 +252,32 @@
         <div class="hr"></div>
 
         <div class="card">
-          <div class="card-title">帯域スキャン（巨大ファイル向け / 5秒単位）</div>
+          <div class="card-title">帯域スキャン（巨大WAV向け / 5秒単位）</div>
           <div class="note">
-            ※ MP3/WAV等に対応（file.slice() → decodeAudioData → FFT解析）。MP3は圧縮の都合で分割境界で decode 失敗する場合がありますが、そのセグメントはスキップして継続します。
+            ※ file.slice() でPCM領域を直接読み出す方式のため、現状は <b>WAV（PCM/Float）</b> のみ対応です。
           </div>
 
           <div class="grid3">
             <div class="field">
               <label>最小周波数 (Hz)</label>
               <input id="scanMinHz" type="range" min="0" max="24000" step="10" value="2000"/>
-              <div class="hint mono"><input id="scanMinHzVal" type="number" min="0" max="24000" step="10" value="2000" /> Hz</div>
+              <div class="hint mono"><span id="scanMinHzVal">2000</span> Hz</div>
             </div>
             <div class="field">
               <label>最大周波数 (Hz)</label>
               <input id="scanMaxHz" type="range" min="0" max="24000" step="10" value="8000"/>
-              <div class="hint mono"><input id="scanMaxHzVal" type="number" min="0" max="24000" step="10" value="8000" /> Hz</div>
+              <div class="hint mono"><span id="scanMaxHzVal">8000</span> Hz</div>
             </div>
             <div class="field">
-              <label>感度（しきい値 dB）</label>
-              <input id="scanThreshold" type="range" min="-120" max="0" step="1" value="-45"/>
-              <div class="hint mono"><input id="scanThresholdVal" type="number" min="-120" max="0" step="1" value="-45" /> dB</div>
+              <label>検出感度（ノイズからの浮き上がり dB）</label>
+              <input id="scanThreshold" type="range" min="0" max="40" step="1" value="15"/>
+              <div class="hint mono"><span id="scanThresholdVal">-45</span> dB</div>
             </div>
-          </div>
-
-
-          <div class="row">
-            <span class="pill mono">解析プリセット</span>
-            <button id="presetNight" class="ghost">夜間汎用</button>
-            <button id="presetOwl" class="ghost">フクロウ</button>
-            <button id="presetTora" class="ghost">トラツグミ</button>
-            <div class="flex-grow"></div>
           </div>
 
           <div class="row">
             <button id="scanBtn" class="primary" disabled>全時間スキャン開始</button>
             <button id="scanAbortBtn" class="ghost" disabled>中断</button>
-            <button id="presetNight2" class="ghost" type="button">夜間汎用</button>
-            <button id="presetOwl2" class="ghost" type="button">フクロウ</button>
-            <button id="presetTora2" class="ghost" type="button">トラツグミ</button>
             <div class="flex-grow"></div>
             <span class="pill mono">進捗: <strong id="scanPct">0%</strong></span>
           </div>
