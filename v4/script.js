@@ -37,6 +37,13 @@ const UI = {
   scanMinHzVal: document.getElementById('scanMinHzVal'),
   scanMaxHzVal: document.getElementById('scanMaxHzVal'),
   scanThresholdVal: document.getElementById('scanThresholdVal'),
+  scanMinHzNum: document.getElementById('scanMinHzNum'),
+  scanMaxHzNum: document.getElementById('scanMaxHzNum'),
+  scanThresholdNum: document.getElementById('scanThresholdNum'),
+
+  presetNight: document.getElementById('presetNight'),
+  presetOwl: document.getElementById('presetOwl'),
+  presetTratsugumi: document.getElementById('presetTratsugumi'),
   scanBtn: document.getElementById('scanBtn'),
   scanAbortBtn: document.getElementById('scanAbortBtn'),
   scanPct: document.getElementById('scanPct'),
@@ -925,24 +932,91 @@ function addDetectButton(sec){
 }
 
 function wireScanSliders(){
-  const sync = () => {
-    const min = parseInt(UI.scanMinHz.value,10)||0;
-    const max = parseInt(UI.scanMaxHz.value,10)||0;
-    const thr = parseInt(UI.scanThreshold.value,10)||-60;
-    UI.scanMinHzVal.textContent = String(min);
-    UI.scanMaxHzVal.textContent = String(max);
-    UI.scanThresholdVal.textContent = String(thr);
+  const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  const syncFromRange = () => {
+    let min = parseInt(UI.scanMinHz.value,10) || 0;
+    let max = parseInt(UI.scanMaxHz.value,10) || 0;
+    let thr = parseInt(UI.scanThreshold.value,10);
+    if (!Number.isFinite(thr)) thr = -60;
+
     // keep min<=max
     if (min > max) {
-      UI.scanMaxHz.value = UI.scanMinHz.value;
-      UI.scanMaxHzVal.textContent = UI.scanMinHzVal.textContent;
+      max = min;
+      UI.scanMaxHz.value = String(max);
     }
+
+    // update number boxes
+    if (UI.scanMinHzNum) UI.scanMinHzNum.value = String(min);
+    if (UI.scanMaxHzNum) UI.scanMaxHzNum.value = String(max);
+    if (UI.scanThresholdNum) UI.scanThresholdNum.value = String(thr);
+
+    // update legacy labels
+    if (UI.scanMinHzVal) UI.scanMinHzVal.textContent = String(min);
+    if (UI.scanMaxHzVal) UI.scanMaxHzVal.textContent = String(max);
+    if (UI.scanThresholdVal) UI.scanThresholdVal.textContent = String(thr);
   };
-  UI.scanMinHz.addEventListener('input', sync);
-  UI.scanMaxHz.addEventListener('input', sync);
-  UI.scanThreshold.addEventListener('input', sync);
-  sync();
+
+  const syncFromNumber = (which) => {
+    // read + clamp to input min/max
+    const read = (numEl, rangeEl) => {
+      if (!numEl || !rangeEl) return;
+      const lo = parseFloat(rangeEl.min);
+      const hi = parseFloat(rangeEl.max);
+      const step = parseFloat(rangeEl.step) || 1;
+
+      let v = parseFloat(numEl.value);
+      if (!Number.isFinite(v)) return;
+
+      // snap to step
+      v = Math.round(v / step) * step;
+      v = clampNum(v, lo, hi);
+
+      rangeEl.value = String(v);
+      numEl.value = String(v);
+    };
+
+    if (which === 'min') read(UI.scanMinHzNum, UI.scanMinHz);
+    if (which === 'max') read(UI.scanMaxHzNum, UI.scanMaxHz);
+    if (which === 'thr') read(UI.scanThresholdNum, UI.scanThreshold);
+
+    // keep min<=max
+    const min = parseInt(UI.scanMinHz.value,10) || 0;
+    const max = parseInt(UI.scanMaxHz.value,10) || 0;
+    if (min > max) {
+      UI.scanMaxHz.value = UI.scanMinHz.value;
+      if (UI.scanMaxHzNum) UI.scanMaxHzNum.value = UI.scanMinHz.value;
+    }
+
+    syncFromRange();
+  };
+
+  // range -> number
+  UI.scanMinHz.addEventListener('input', syncFromRange);
+  UI.scanMaxHz.addEventListener('input', syncFromRange);
+  UI.scanThreshold.addEventListener('input', syncFromRange);
+
+  // number -> range
+  if (UI.scanMinHzNum) UI.scanMinHzNum.addEventListener('input', () => syncFromNumber('min'));
+  if (UI.scanMaxHzNum) UI.scanMaxHzNum.addEventListener('input', () => syncFromNumber('max'));
+  if (UI.scanThresholdNum) UI.scanThresholdNum.addEventListener('input', () => syncFromNumber('thr'));
+
+  // presets
+  const setPreset = (min, max, thr) => {
+    UI.scanMinHz.value = String(min);
+    UI.scanMaxHz.value = String(max);
+    UI.scanThreshold.value = String(thr);
+    // numbers + labels update
+    syncFromRange();
+  };
+
+  if (UI.presetNight) UI.presetNight.addEventListener('click', () => setPreset(800, 4000, -50));
+  if (UI.presetOwl) UI.presetOwl.addEventListener('click', () => setPreset(400, 1200, -45));
+  if (UI.presetTratsugumi) UI.presetTratsugumi.addEventListener('click', () => setPreset(2000, 2800, -40));
+
+  syncFromRange();
 }
+
 
 async function readWavHeader(file){
   // Read first 256KB for safety (chunks may extend)
@@ -1158,7 +1232,7 @@ async function scanBand(file){
 
       // STFT over this decoded chunk (5s前後)
       const hop = FFT_N >> 1;
-      let acc = 0;
+      let peakPow = 0;
       let frames = 0;
 
       for (let i=0; i + FFT_N <= mono.length; i += hop){
@@ -1173,13 +1247,14 @@ async function scanBand(file){
           const rr = re[b], ii = im[b];
           bandPow += rr*rr + ii*ii;
         }
-        acc += bandPow;
+
+        if (bandPow > peakPow) peakPow = bandPow;
         frames++;
         if (sig.aborted) break;
       }
 
-      const meanPow = frames ? (acc / frames) : 0;
-      const db = 10 * Math.log10(meanPow + 1e-12);
+      // ★判定は「帯域内ピーク（最大音圧）」で行う
+      const db = 10 * Math.log10(peakPow + 1e-12);
 
       // 進捗
       const pct = ((seg+1)/totalSeg)*100;
