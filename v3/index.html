@@ -3,262 +3,361 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>野鳥の鳴き声 解析・可視化（WaveTone風タイムライン v2.2）</title>
+  <title>Bird Voice Spectrogram WaveTone風タイムライン v2.5.1</title>
   <style>
     :root{
-      --bg:#0b1220;
-      --text:#e8eefc;
-      --muted:#a9b6d6;
-      --line:rgba(255,255,255,.10);
-      --shadow: 0 10px 30px rgba(0,0,0,.35);
-      --radius: 16px;
+      --bg:#0b0f17; --panel:#0f1624; --panel2:#0d1320;
+      --text:#e9eef7; --muted:#a9b5c9; --line:rgba(255,255,255,.10);
+      --accent:#5eead4; --danger:#ff6b6b; --shadow:0 16px 40px rgba(0,0,0,.35);
+      --radius:16px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans JP", Helvetica, Arial;
     }
-    *{box-sizing:border-box}
+    html,body{height:100%;}
     body{
-      margin:0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans JP", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Yu Gothic", "Meiryo", Arial, sans-serif;
-      background: radial-gradient(1000px 700px at 20% -10%, rgba(110,231,255,.18), transparent 55%),
-                  radial-gradient(900px 650px at 110% 10%, rgba(167,139,250,.16), transparent 55%),
-                  linear-gradient(180deg, var(--bg), #070b14 70%);
+      margin:0; font-family:var(--sans);
+      background: radial-gradient(1200px 800px at 25% 10%, rgba(94,234,212,.12), transparent 55%),
+                  radial-gradient(900px 600px at 85% 20%, rgba(125,211,252,.10), transparent 55%),
+                  linear-gradient(180deg, var(--bg), #05070c);
       color:var(--text);
-      min-height:100vh;
     }
-    header{padding:24px 18px 12px; max-width:1200px; margin:0 auto;}
-    .title{display:flex; gap:12px; align-items:center; flex-wrap:wrap;}
+    .wrap{max-width:1320px; margin:0 auto; padding:22px 16px 36px;}
+    header{
+      display:flex; gap:14px; align-items:flex-start; justify-content:space-between;
+      padding:14px 16px; border:1px solid var(--line); border-radius:var(--radius);
+      background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+      box-shadow:var(--shadow);
+    }
+    h1{margin:0; font-size:18px; letter-spacing:.2px}
+    .sub{margin-top:6px; color:var(--muted); font-size:13px; line-height:1.4}
+    .badges{display:flex; flex-wrap:wrap; gap:8px; justify-content:flex-end}
     .badge{
-      font-size:12px; padding:6px 10px; border:1px solid var(--line);
-      border-radius:999px; background:rgba(255,255,255,.05);
-      color:var(--muted); white-space:nowrap;
+      padding:6px 10px; border-radius:999px;
+      background: rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.12);
+      color:var(--muted); font-weight:800; font-size:12px;
     }
-    h1{margin:0; font-size:20px; letter-spacing:.2px;}
-    p{margin:10px 0 0; color:var(--muted); line-height:1.5; font-size:13px;}
-    main{max-width:1200px; margin:0 auto; padding:12px 18px 30px;}
+    .mono{font-family:var(--mono)}
+    .row{display:flex; flex-wrap:wrap; gap:10px; align-items:end}
     .panel{
+      margin-top:14px;
+      border:1px solid var(--line);
+      border-radius:var(--radius);
+      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.02));
+      box-shadow:var(--shadow);
+      overflow:hidden;
+    }
+    .panel .head{
+      padding:12px 14px; border-bottom:1px solid var(--line);
+      display:flex; justify-content:space-between; align-items:center; gap:12px;
+      background: rgba(0,0,0,.12);
+    }
+    .panel .body{padding:14px; display:grid; gap:12px;}
+    .pill{
+      display:inline-flex; gap:8px; align-items:center;
+      padding:6px 10px; border-radius:999px;
+      background: rgba(0,0,0,.18);
+      border:1px solid rgba(255,255,255,.10);
+      font-size:12px; color:var(--muted); font-weight:800;
+    }
+    .field{display:grid; gap:6px;}
+    .field label{font-size:12px; color:var(--muted); font-weight:800}
+    input, select, button{
+      font:inherit; color:var(--text);
+      background: rgba(0,0,0,.22);
+      border:1px solid rgba(255,255,255,.14);
+      border-radius:12px;
+      padding:10px 12px;
+      outline:none;
+    }
+    input[type="file"]{padding:10px;}
+    input:focus, select:focus{border-color:rgba(94,234,212,.55); box-shadow:0 0 0 3px rgba(94,234,212,.15);}
+    button{
+      cursor:pointer; font-weight:900;
+      background: linear-gradient(180deg, rgba(94,234,212,.20), rgba(94,234,212,.06));
+      border-color: rgba(94,234,212,.35);
+    }
+    button.secondary{
+      background: rgba(255,255,255,.06);
+      border-color: rgba(255,255,255,.14);
+      color:var(--text);
+    }
+    button.danger{
+      background: linear-gradient(180deg, rgba(255,107,107,.22), rgba(255,107,107,.06));
+      border-color: rgba(255,107,107,.45);
+    }
+    button:disabled{opacity:.45; cursor:not-allowed}
+    .grid{
+      display:grid;
+      grid-template-columns: 1.2fr 1fr 1fr 1fr;
+      gap:10px;
+    }
+    @media (max-width: 980px){
+      .grid{grid-template-columns: 1fr 1fr;}
+      header{flex-direction:column; align-items:stretch}
+      .badges{justify-content:flex-start}
+    }
+    .split{
+      display:grid;
+      grid-template-columns: 1fr 320px;
+      gap:14px;
+      align-items:start;
+    }
+    @media (max-width: 980px){ .split{grid-template-columns:1fr;} }
+
+    /* timeline */
+    .timeline{
+      border:1px solid var(--line); border-radius:var(--radius);
+      background: rgba(0,0,0,.14);
+      overflow:hidden;
+    }
+    .viewport{
+      position:relative;
+      overflow:auto;
+      height: 520px;
+      background: rgba(0,0,0,.14);
+    }
+    canvas{display:block;}
+    .footerrow{display:flex; gap:10px; flex-wrap:wrap; align-items:center; justify-content:space-between}
+    .bar{height:10px; border-radius:999px; background:rgba(255,255,255,.08); overflow:hidden; border:1px solid rgba(255,255,255,.10)}
+    .bar > div{height:100%; width:0%; background: linear-gradient(90deg, rgba(94,234,212,.80), rgba(125,211,252,.85));}
+
+    /* side list */
+    .side{
       background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
       border:1px solid var(--line);
       border-radius: var(--radius);
       box-shadow: var(--shadow);
       overflow:hidden;
     }
-    .controls{padding:14px; display:grid; gap:10px;}
-    .row{display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between;}
-    .row-left{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
-    .row-right{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
-    .field{
-      display:flex; gap:8px; align-items:center; flex-wrap:wrap;
-      padding:10px 12px; border:1px solid var(--line);
-      border-radius:12px; background:rgba(0,0,0,.18);
-    }
-    .field label{font-size:12px; color:var(--muted)}
-    input[type="file"]{color:var(--muted)}
-    input[type="number"], select{
-      width:96px; padding:8px 10px; border-radius:10px;
-      border:1px solid var(--line); background:rgba(0,0,0,.25);
-      color:var(--text); outline:none;
-    }
-    select{width:auto; max-width:220px;}
-    input[type="checkbox"]{transform:scale(1.1)}
-    button{
-      appearance:none; border:1px solid var(--line);
-      background: linear-gradient(180deg, rgba(110,231,255,.18), rgba(110,231,255,.06));
-      color:var(--text); padding:10px 12px; border-radius:12px;
-      cursor:pointer; transition: transform .06s ease, filter .12s ease, opacity .12s ease;
-      font-weight:700; letter-spacing:.2px; font-size:13px; white-space:nowrap;
-    }
-    button:hover{filter:brightness(1.08)}
-    button:active{transform:translateY(1px)}
-    button.secondary{background: linear-gradient(180deg, rgba(167,139,250,.18), rgba(167,139,250,.06));}
-    button.danger{background: linear-gradient(180deg, rgba(255,107,107,.22), rgba(255,107,107,.08));}
-    button:disabled{opacity:.45; cursor:not-allowed; filter:grayscale(.2);}
-    .progress{padding:0 14px 14px; display:grid; gap:8px;}
-    .bar{height:10px; border-radius:999px; border:1px solid var(--line); background:rgba(0,0,0,.25); overflow:hidden;}
-    .bar > div{height:100%; width:0%; background: linear-gradient(90deg, rgba(110,231,255,.95), rgba(167,139,250,.95)); transition: width .15s ease;}
-    .meta{display:flex; flex-wrap:wrap; gap:10px 14px; color:var(--muted); font-size:12px; align-items:center; justify-content:space-between;}
-    .pill{padding:4px 8px; border:1px solid var(--line); border-radius:999px; background:rgba(255,255,255,.04); color:var(--muted); font-size:12px; white-space:nowrap;}
-    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
-    .log{
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      font-size:12px; color:var(--muted);
-      white-space:pre-wrap; line-height:1.45;
-      padding:12px 14px; border-top:1px solid var(--line);
-      background: rgba(0,0,0,.16);
-      max-height:220px; overflow:auto;
-    }
-    .timeline-wrap{
-      margin-top:14px; border:1px solid var(--line);
-      border-radius: var(--radius); background: rgba(0,0,0,.18);
-      box-shadow: var(--shadow); overflow:hidden;
-    }
-    .timeline-toolbar{
-      display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between;
-      padding:10px 12px; border-bottom:1px solid var(--line);
+    .side .head{
+      padding:10px 12px;
+      border-bottom:1px solid var(--line);
       background: rgba(0,0,0,.10);
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      align-items:center;
+      justify-content:space-between;
     }
-    .viewport{
-      position:relative;
-      height: 380px;
+    .side .body{ padding:12px; display:grid; gap:10px; }
+    .list{
+      border:1px solid var(--line);
+      border-radius:12px;
+      background: rgba(0,0,0,.14);
+      max-height: 360px;
       overflow:auto;
-      background:#0b0f1c;
     }
-    .spacer{height:100%;}
-    canvas#specCanvas{
-      position:sticky; left:0; top:0;
-      display:block; width:100%; height:100%;
-      background:#ffffff;
+    .hit{
+      padding:10px 10px;
+      border-bottom:1px solid rgba(255,255,255,.08);
+      cursor:pointer;
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+      align-items:center;
     }
-    .hint{
-      padding:10px 12px; border-top:1px solid var(--line);
-      color:var(--muted); font-size:12px; line-height:1.5;
-      background: rgba(0,0,0,.10);
+    .hit:hover{ background: rgba(255,255,255,.06); }
+    .hit:last-child{ border-bottom:none; }
+    .hit .t{ font-weight:900; }
+    .hit .v{ color: var(--muted); font-size:12px; }
+    .btnrow{ display:flex; gap:8px; flex-wrap:wrap; }
+    .mini{ padding:8px 10px; border-radius:10px; font-size:12px; font-weight:900; }
+
+    pre#log{
+      margin:0; padding:12px 14px;
+      background: rgba(0,0,0,.22);
+      border-top:1px solid var(--line);
+      color: #c7d2fe;
+      font-size:12px;
+      max-height: 180px;
+      overflow:auto;
+      font-family:var(--mono);
+      white-space:pre-wrap;
     }
   </style>
 </head>
 <body>
+<div class="wrap">
   <header>
-    <div class="title">
-      <h1>野鳥の鳴き声 解析・可視化（WaveTone風タイムライン v2.2）</h1>
+    <div>
+      <h1>Bird Voice Spectrogram — WaveTone風タイムライン <span class="mono">v2.5.1</span></h1>
+      <div class="sub">
+        巨大ファイル対応（ビューポート描画＋タイルキャッシュ） / クリックでシーク再生 / 赤線が再生位置<br>
+        <b>重要:</b> <span class="mono">index.html</span> と <span class="mono">script.js</span> を必ずセットで上書き（片方だけだとボタンが反応しない原因になります）
+      </div>
+    </div>
+    <div class="badges">
       <span class="badge">色マップ</span>
       <span class="badge">対数周波数</span>
-      <span class="badge">鳥声帯域強調</span>
-      <span class="badge">PNG書き出し</span>
-      <span class="badge">安定動作（分析用再生を常時ON）</span>
+      <span class="badge">帯域強調</span>
+      <span class="badge">検出マーカー</span>
+      <span class="badge">PNG保存（表示/範囲）</span>
+      <span class="badge">検出スキャン（再利用で高速）</span>
     </div>
-    <p>
-      ※ v2.2 は「タイル解析のたびに play() しない」方式に変更（Chromeの制限で止まる問題を回避）。<br/>
-      クリック: その時刻から再生 / スクロール: 時間移動 / 赤線: 現在再生位置
-    </p>
   </header>
 
-  <main>
-    <section class="panel">
-      <div class="controls">
+  <section class="panel">
+    <div class="head">
+      <span class="pill">1) ファイル読み込み / 準備</span>
+      <span class="pill mono" id="state">未準備</span>
+    </div>
+    <div class="body">
+      <div class="grid">
+        <div class="field">
+          <label>音声ファイル（MP3/WAV）</label>
+          <input id="fileInput" type="file" accept="audio/*" />
+        </div>
+        <div class="field">
+          <label>タイル秒（解析単位）</label>
+          <input id="tileSec" type="number" min="2" max="20" step="1" value="5" />
+        </div>
+        <div class="field">
+          <label>解析FPS（横解像度）</label>
+          <input id="fps" type="number" min="5" max="120" step="1" value="30" />
+        </div>
+        <div class="field">
+          <label>FFTサイズ</label>
+          <select id="fftSize">
+            <option>1024</option>
+            <option selected>2048</option>
+            <option>4096</option>
+            <option>8192</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>表示上限Hz</label>
+          <input id="maxHz" type="number" min="1000" max="24000" step="100" value="12000" />
+        </div>
+        <div class="field">
+          <label>dBレンジ（min / max）</label>
+          <div class="row">
+            <input id="minDb" type="number" min="-120" max="-20" step="1" value="-100" style="width:120px">
+            <input id="maxDb" type="number" min="-80" max="0" step="1" value="-20" style="width:120px">
+          </div>
+        </div>
+        <div class="field">
+          <label>色マップ</label>
+          <select id="cmap">
+            <option>Turbo</option>
+            <option>Magma</option>
+            <option>Viridis</option>
+            <option selected>Grayscale</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>周波数軸</label>
+          <select id="freqScale">
+            <option value="linear">linear</option>
+            <option value="log" selected>log</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>ズーム（px/秒）</label>
+          <input id="pxPerSec" type="number" min="30" max="400" step="10" value="120" />
+        </div>
+        <div class="field">
+          <label>キャッシュタイル数</label>
+          <input id="cacheTiles" type="number" min="10" max="400" step="10" value="120" />
+        </div>
+        <div class="field">
+          <label>鳥帯域強調（Hz）</label>
+          <div class="row">
+            <input id="hlMinHz" type="number" min="0" max="24000" step="100" value="2500" style="width:120px">
+            <input id="hlMaxHz" type="number" min="0" max="24000" step="100" value="9000" style="width:120px">
+          </div>
+        </div>
+        <div class="field">
+          <label>PNG範囲(s)</label>
+          <div class="row">
+            <input id="exportStartSec" type="number" min="0" step="1" value="0" style="width:120px">
+            <input id="exportEndSec" type="number" min="0" step="1" value="30" style="width:120px">
+          </div>
+        </div>
+      </div>
+
+      <div class="row">
+        <button id="prepareBtn">読み込み/準備</button>
+        <button id="playBtn" class="secondary" disabled>再生</button>
+        <button id="pauseBtn" class="secondary" disabled>一時停止</button>
+        <button id="stopBtn" class="secondary" disabled>停止</button>
+        <button id="clearBtn" class="danger">リセット</button>
+        <span class="pill mono" id="meta">-</span>
+      </div>
+
+      <div class="footerrow">
+        <div style="flex:1; min-width: 220px;">
+          <div class="bar"><div id="progFill"></div></div>
+        </div>
         <div class="row">
-          <div class="row-left">
-            <div class="field">
-              <label>音声</label>
-              <input id="fileInput" type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg" />
-            </div>
-
-            <div class="field">
-              <label>FFT</label>
-              <input id="fftSize" type="number" min="512" max="8192" step="512" value="1024" />
-              <span class="pill">鳥:1024</span>
-            </div>
-
-            <div class="field">
-              <label>解析FPS</label>
-              <input id="fps" type="number" min="10" max="120" step="1" value="60" />
-            </div>
-
-            <div class="field">
-              <label>帯域(Hz)</label>
-              <input id="minHz" type="number" min="0" max="20000" step="100" value="2000" />
-              <span class="pill">〜</span>
-              <input id="maxHz" type="number" min="0" max="24000" step="100" value="12000" />
-            </div>
-
-            <div class="field">
-              <label>dB</label>
-              <input id="minDb" type="number" min="-120" max="-10" step="1" value="-100" />
-              <span class="pill">〜</span>
-              <input id="maxDb" type="number" min="-120" max="0" step="1" value="-25" />
-            </div>
-
-            <div class="field">
-              <label>ズーム(px/秒)</label>
-              <input id="pxPerSec" type="number" min="20" max="400" step="10" value="120" />
-            </div>
-
-            <div class="field">
-              <label>タイル秒</label>
-              <input id="tileSec" type="number" min="2" max="20" step="1" value="5" />
-            </div>
-
-            <div class="field">
-              <label>キャッシュ</label>
-              <input id="cacheTiles" type="number" min="10" max="300" step="10" value="80" />
-            </div>
-
-            <div class="field">
-              <label>色</label>
-              <select id="colorMap">
-                <option value="turbo" selected>Turbo</option>
-                <option value="magma">Magma</option>
-                <option value="viridis">Viridis</option>
-                <option value="grayscale">Grayscale</option>
-              </select>
-            </div>
-
-            <div class="field">
-              <label>周波数軸</label>
-              <select id="freqScale">
-                <option value="log" selected>log</option>
-                <option value="linear">linear</option>
-              </select>
-            </div>
-
-            <div class="field">
-              <label>帯域強調</label>
-              <input id="bandHighlight" type="checkbox" checked />
-              <span class="pill">鳥声</span>
-              <input id="birdMinHz" type="number" min="0" max="24000" step="100" value="2500" />
-              <span class="pill">〜</span>
-              <input id="birdMaxHz" type="number" min="0" max="24000" step="100" value="9000" />
-            </div>
-          </div>
-
-          <div class="row-right">
-            <button id="prepareBtn">読み込み/準備</button>
-            <button id="playBtn" class="secondary" disabled>再生</button>
-            <button id="pauseBtn" class="secondary" disabled>一時停止</button>
-            <button id="stopBtn" class="danger" disabled>停止</button>
-            <button id="exportViewBtn" class="secondary" disabled>PNG保存（表示中）</button>
-            <button id="clearBtn" class="secondary">クリア</button>
-          </div>
+          <button id="exportViewBtn" class="secondary" disabled>PNG保存（表示中）</button>
+          <button id="exportRangeBtn" class="secondary" disabled>PNG保存（範囲）</button>
+          <span class="pill mono" id="tileInfo">tile: -</span>
         </div>
       </div>
 
-      <div class="progress">
-        <div class="bar"><div id="barFill"></div></div>
-        <div class="meta">
-          <div>
-            <span class="pill">長さ: <strong id="durLabel">-</strong></span>
-            <span class="pill">状態: <strong id="stateLabel">待機</strong></span>
-            <span class="pill">表示: <strong id="viewLabel">-</strong></span>
-          </div>
-          <div>
-            <span class="pill mono">タイル: <strong id="tileLabel">-</strong></span>
-          </div>
-        </div>
+      <audio id="fullAudio" controls style="width:100%"></audio>
+    </div>
+    <pre id="log"></pre>
+  </section>
+
+  <div class="split" style="margin-top:14px">
+    <section class="timeline">
+      <div class="head" style="padding:12px 14px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:12px; background: rgba(0,0,0,.12);">
+        <span class="pill">2) ロング・スペクトログラム（スクロール）</span>
+        <span class="pill mono" id="viewportInfo">view: -</span>
       </div>
-
-      <div id="log" class="log" aria-live="polite"></div>
-    </section>
-
-    <section class="timeline-wrap">
-      <div class="timeline-toolbar">
-        <div class="left">
-          <span class="pill">クリックでシーク / スクロールで移動 / 赤線=再生位置</span>
-          <span class="pill">再生中は赤線に追従</span>
-        </div>
-        <div>
-          <span class="pill mono">kHz目盛り + グリッド</span>
-        </div>
-      </div>
-
-      <div id="viewport" class="viewport" tabindex="0">
-        <div id="spacer" class="spacer"></div>
-        <canvas id="specCanvas"></canvas>
-      </div>
-
-      <div class="hint">
-        「薄い」→ <span class="mono">minDb</span>を下げる（例 -110） / 「濃すぎ」→ <span class="mono">maxDb</span>を下げる（例 -35）
+      <div class="viewport" id="viewport">
+        <canvas id="specCanvas" width="1200" height="520"></canvas>
       </div>
     </section>
 
-    <audio id="fullAudio" controls style="width:100%; margin-top:14px; display:none;"></audio>
-  </main>
+    <div class="side" id="detectPanel">
+      <div class="head">
+        <span class="pill">検出箇所リスト（クリックでジャンプ）</span>
+        <span class="pill mono" id="detectCount">0件</span>
+      </div>
+      <div class="body">
+        <div class="field">
+          <label>検出帯域(Hz)</label>
+          <div class="row">
+            <input id="scanMinHz" type="number" min="0" max="24000" step="100" value="3000" style="width:120px" />
+            <span class="pill">〜</span>
+            <input id="scanMaxHz" type="number" min="0" max="24000" step="100" value="12000" style="width:120px" />
+          </div>
+        </div>
 
-  <script src="./script.js"></script>
+        <div class="field">
+          <label>閾値(dB)</label>
+          <input id="scanThresholdDb" type="number" min="-120" max="0" step="1" value="-55" />
+        </div>
+
+        <div class="field">
+          <label>ステップ(s)</label>
+          <input id="scanStepSec" type="number" min="0.1" max="2.0" step="0.1" value="0.5" />
+        </div>
+
+        <div class="btnrow">
+          <button class="mini secondary" id="presetSmallBird">小鳥(3kHz〜)</button>
+          <button class="mini secondary" id="presetRaptor">猛禽(1.5kHz〜)</button>
+          <button class="mini secondary" id="presetAll">全帯域(0Hz〜)</button>
+        </div>
+
+        <div class="btnrow">
+          <button class="mini" id="scanBtn" disabled>スキャン開始</button>
+          <button class="mini danger" id="scanStopBtn" disabled>停止</button>
+        </div>
+
+        <div class="bar"><div id="scanBarFill"></div></div>
+        <div class="pill mono" id="scanStatus">scan: -</div>
+
+        <div class="list" id="detectList"></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+<script src="./script.js"></script>
 </body>
 </html>

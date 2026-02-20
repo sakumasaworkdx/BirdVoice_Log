@@ -1,56 +1,72 @@
-/* eslint-disable no-console */
 'use strict';
 
 /**
- * v2.2（重要）
- * - v2で止まる原因: タイル生成ごとに audio.play() すると、Chromeの自動再生制限で失敗 → 解析が進まない
- * - 対策: 「解析用audio」を prepare(ユーザー操作)で一度だけ play() し、その後は常時再生状態のまま seek してサンプリング
- *
- * 追加機能（v2要件）
- * - 色マップ（Turbo/Magma/Viridis/Gray）
- * - 対数周波数軸（log / linear）
- * - 鳥声帯域の強調表示（帯域ハイライト）
- * - PNG書き出し（表示中ビューポート）
+ * v2.5.1
+ * - 読み込み/準備が反応しない原因のほとんどは「index.html と script.js の不一致」です。
+ *   このスクリプトは、要素が無い場合でも落ちないようにガードしてあります。
  */
+
+window.addEventListener('error', (e) => {
+  try {
+    const el = document.getElementById('log');
+    if (!el) return;
+    const msg = e?.message || 'unknown';
+    const src = e?.filename ? ` @ ${e.filename}:${e.lineno}` : '';
+    el.textContent += `[JS ERROR] ${msg}${src}\n`;
+  } catch {}
+});
+
+const AXIS_W = 64;
+const PAD_T = 8;
+const PAD_B = 16;
+const TILE_H = 512;
+
+const PREFETCH_TILES = 2;
+const SCROLL_IDLE_MS = 140;
+const PREVIEW_FPS_MAX = 20;
+
+const FEATURE_BANDS = 48;
 
 const UI = {
   fileInput: document.getElementById('fileInput'),
-  fftSize: document.getElementById('fftSize'),
-  fps: document.getElementById('fps'),
-  minHz: document.getElementById('minHz'),
-  maxHz: document.getElementById('maxHz'),
-  minDb: document.getElementById('minDb'),
-  maxDb: document.getElementById('maxDb'),
-  pxPerSec: document.getElementById('pxPerSec'),
-  tileSec: document.getElementById('tileSec'),
-  cacheTiles: document.getElementById('cacheTiles'),
-  colorMap: document.getElementById('colorMap'),
-  freqScale: document.getElementById('freqScale'),
-  bandHighlight: document.getElementById('bandHighlight'),
-  birdMinHz: document.getElementById('birdMinHz'),
-  birdMaxHz: document.getElementById('birdMaxHz'),
-
   prepareBtn: document.getElementById('prepareBtn'),
   playBtn: document.getElementById('playBtn'),
   pauseBtn: document.getElementById('pauseBtn'),
   stopBtn: document.getElementById('stopBtn'),
-  exportViewBtn: document.getElementById('exportViewBtn'),
   clearBtn: document.getElementById('clearBtn'),
 
-  barFill: document.getElementById('barFill'),
-  durLabel: document.getElementById('durLabel'),
-  stateLabel: document.getElementById('stateLabel'),
-  viewLabel: document.getElementById('viewLabel'),
-  tileLabel: document.getElementById('tileLabel'),
+  tileSec: document.getElementById('tileSec'),
+  fps: document.getElementById('fps'),
+  fftSize: document.getElementById('fftSize'),
+  maxHz: document.getElementById('maxHz'),
+  minDb: document.getElementById('minDb'),
+  maxDb: document.getElementById('maxDb'),
+  cmap: document.getElementById('cmap'),
+  freqScale: document.getElementById('freqScale'),
+  pxPerSec: document.getElementById('pxPerSec'),
+  cacheTiles: document.getElementById('cacheTiles'),
+  hlMinHz: document.getElementById('hlMinHz'),
+  hlMaxHz: document.getElementById('hlMaxHz'),
+
+  exportStartSec: document.getElementById('exportStartSec'),
+  exportEndSec: document.getElementById('exportEndSec'),
+  exportViewBtn: document.getElementById('exportViewBtn'),
+  exportRangeBtn: document.getElementById('exportRangeBtn'),
+
+  state: document.getElementById('state'),
+  meta: document.getElementById('meta'),
+  tileInfo: document.getElementById('tileInfo'),
+  viewportInfo: document.getElementById('viewportInfo'),
+  progFill: document.getElementById('progFill'),
   log: document.getElementById('log'),
 
   viewport: document.getElementById('viewport'),
-  spacer: document.getElementById('spacer'),
   specCanvas: document.getElementById('specCanvas'),
-
   fullAudio: document.getElementById('fullAudio'),
 
+  // scan
   scanMinHz: document.getElementById('scanMinHz'),
+  scanMaxHz: document.getElementById('scanMaxHz'),
   scanThresholdDb: document.getElementById('scanThresholdDb'),
   scanStepSec: document.getElementById('scanStepSec'),
   presetSmallBird: document.getElementById('presetSmallBird'),
@@ -64,94 +80,151 @@ const UI = {
   scanStatus: document.getElementById('scanStatus'),
 };
 
-function logLine(msg) {
-  const t = new Date().toLocaleTimeString();
-  UI.log.textContent += `[${t}] ${msg}\n`;
+function logLine(s){
+  if (!UI.log) return;
+  UI.log.textContent += s + "\n";
   UI.log.scrollTop = UI.log.scrollHeight;
 }
-function setState(s) { UI.stateLabel.textContent = s; }
-function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function secToHMS(sec) {
-  if (!Number.isFinite(sec)) return '-';
-  const s = Math.max(0, sec);
-  const hh = Math.floor(s / 3600);
-  const mm = Math.floor((s % 3600) / 60);
-  const ss = s % 60;
-  const pad2 = (v) => String(v).padStart(2, '0');
-  if (hh > 0) return `${hh}:${pad2(mm)}:${pad2(ss.toFixed(0))}`;
-  return `${mm}:${pad2(ss.toFixed(0))}`;
-}
-function fmtBytes(n) {
-  const u = ['B','KB','MB','GB','TB'];
-  let x=n, i=0;
-  while (x>=1024 && i<u.length-1){ x/=1024; i++; }
-  return `${x.toFixed(i===0?0:2)} ${u[i]}`;
-}
-function nowMs(){ return performance.now(); }
 
-function downloadBlob(blob, filename) {
-  const url = URL.createObjectURL(blob);
+function setState(s){
+  if (UI.state) UI.state.textContent = s;
+}
+
+function nowMs(){ return performance.now(); }
+function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+function secToHMS(sec){
+  sec = Math.max(0, sec);
+  const h = Math.floor(sec/3600);
+  const m = Math.floor((sec%3600)/60);
+  const s = Math.floor(sec%60);
+  const ms = Math.floor((sec - Math.floor(sec))*1000);
+  if (h>0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  return `${m}:${String(s).padStart(2,'0')}.${String(ms).padStart(3,'0')}`;
+}
+
+function downloadBlob(blob, filename){
   const a = document.createElement('a');
-  a.href = url;
+  a.href = URL.createObjectURL(blob);
   a.download = filename;
   document.body.appendChild(a);
   a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
 }
 
-/** ===================== Color maps ===================== */
-function turbo(t){
-  t = clamp(t,0,1);
-  const r = clamp(34.61 + t*(1172.33 + t*(-10793.56 + t*(33300.12 + t*(-38394.49 + t*14825.05)))), 0, 255);
-  const g = clamp(23.31 + t*(557.33 + t*(1225.33 + t*(-3574.96 + t*(1858.50 + t*0.00)))), 0, 255);
-  const b = clamp(27.20 + t*(3211.10 + t*(-15327.97 + t*(27814.00 + t*(-22569.18 + t*6838.66)))), 0, 255);
-  return [r|0, g|0, b|0];
+function getConfig(){
+  const tileSec = clamp(parseFloat(UI.tileSec?.value) || 5, 2, 20);
+  const fps = clamp(parseFloat(UI.fps?.value) || 30, 5, 120);
+  const fftSize = parseInt(UI.fftSize?.value || '2048', 10);
+  const maxHz = clamp(parseFloat(UI.maxHz?.value) || 12000, 1000, 24000);
+  const minDb = clamp(parseFloat(UI.minDb?.value) || -100, -120, -10);
+  const maxDb = clamp(parseFloat(UI.maxDb?.value) || -20, -80, 0);
+  const cmap = UI.cmap?.value || 'Grayscale';
+  const freqScale = UI.freqScale?.value || 'log';
+  const pxPerSec = clamp(parseFloat(UI.pxPerSec?.value) || 120, 30, 400);
+  const cacheTiles = clamp(parseInt(UI.cacheTiles?.value || '120', 10), 10, 400);
+  const hlMinHz = clamp(parseFloat(UI.hlMinHz?.value) || 2500, 0, 24000);
+  const hlMaxHz = clamp(parseFloat(UI.hlMaxHz?.value) || 9000, 0, 24000);
+  return {
+    tileSec, fps, fftSize, maxHz, minDb, maxDb, cmap, freqScale, pxPerSec, cacheTiles,
+    hlMinHz: Math.min(hlMinHz, hlMaxHz),
+    hlMaxHz: Math.max(hlMinHz, hlMaxHz),
+    minHz: 50,
+  };
 }
-function viridis(t){
-  t = clamp(t,0,1);
-  const stops = [
-    [68, 1, 84],
-    [59, 82, 139],
-    [33, 145, 140],
-    [94, 201, 98],
-    [253, 231, 37]
-  ];
-  const x = t * (stops.length-1);
-  const i = Math.min(stops.length-2, Math.floor(x));
-  const f = x - i;
-  const a = stops[i], b = stops[i+1];
-  return [
-    (a[0] + (b[0]-a[0])*f)|0,
-    (a[1] + (b[1]-a[1])*f)|0,
-    (a[2] + (b[2]-a[2])*f)|0,
-  ];
-}
-function magma(t){
-  t = clamp(t,0,1);
-  const stops = [
-    [0,0,4],
-    [78,18,123],
-    [150,54,143],
-    [219,118,89],
-    [251,252,191]
-  ];
-  const x = t * (stops.length-1);
-  const i = Math.min(stops.length-2, Math.floor(x));
-  const f = x - i;
-  const a = stops[i], b = stops[i+1];
-  return [
-    (a[0] + (b[0]-a[0])*f)|0,
-    (a[1] + (b[1]-a[1])*f)|0,
-    (a[2] + (b[2]-a[2])*f)|0,
-  ];
-}
-function grayscale(t){
-  const v = (255 - Math.floor(clamp(t,0,1)*255))|0;
-  return [v,v,v];
+function getPreviewConfig(cfg){
+  const fpsPreview = Math.min(cfg.fps, PREVIEW_FPS_MAX);
+  if (fpsPreview === cfg.fps) return cfg;
+  return { ...cfg, fps: fpsPreview };
 }
 
+/** ====== Analyser runtime ====== */
+const analyzer = {
+  inited: false,
+  duration: 0,
+  file: null,
+  url: null,
+
+  audio: null,
+  audioCtx: null,
+  analyser: null,
+  srcNode: null,
+
+  analysisPlaying: false, // muted analysis loop
+};
+
+function clearAll(){
+  // stop
+  try { if (analyzer.audio) analyzer.audio.pause(); } catch {}
+  analyzer.analysisPlaying = false;
+
+  // disconnect audio graph
+  try { analyzer.srcNode?.disconnect(); } catch {}
+  try { analyzer.analyser?.disconnect(); } catch {}
+  try { analyzer.audioCtx?.close(); } catch {}
+
+  analyzer.inited = false;
+  analyzer.duration = 0;
+
+  if (analyzer.url) { try { URL.revokeObjectURL(analyzer.url); } catch {} }
+  analyzer.url = null;
+  analyzer.file = null;
+
+  tileCache.clear();
+  lruOrder.length = 0;
+  tileInFlight.clear();
+  abortCtrl?.abort();
+  abortCtrl = null;
+
+  scanHits = [];
+  updateDetectList();
+  if (UI.scanBarFill) UI.scanBarFill.style.width = '0%';
+  if (UI.scanStatus) UI.scanStatus.textContent = 'scan: -';
+
+  if (UI.meta) UI.meta.textContent = '-';
+  if (UI.tileInfo) UI.tileInfo.textContent = 'tile: -';
+  if (UI.viewportInfo) UI.viewportInfo.textContent = 'view: -';
+  if (UI.progFill) UI.progFill.style.width = '0%';
+
+  if (UI.playBtn) UI.playBtn.disabled = true;
+  if (UI.pauseBtn) UI.pauseBtn.disabled = true;
+  if (UI.stopBtn) UI.stopBtn.disabled = true;
+  if (UI.exportViewBtn) UI.exportViewBtn.disabled = true;
+  if (UI.exportRangeBtn) UI.exportRangeBtn.disabled = true;
+  if (UI.scanBtn) UI.scanBtn.disabled = true;
+  if (UI.scanStopBtn) UI.scanStopBtn.disabled = true;
+
+  if (UI.fullAudio) { UI.fullAudio.src = ''; UI.fullAudio.load(); }
+
+  setState('未準備');
+  logLine('reset.');
+  scheduleRender();
+}
+
+/** ====== Tile cache ====== */
+const tileCache = new Map(); // key -> tile {bitmap,width,height,tileIndex, tileStart, featEdges, featCols, lastUsed}
+const tileInFlight = new Set();
+const lruOrder = []; // keys, oldest first
+
+function makeTileKey(ti, cfg){
+  return `ti:${ti}|sec:${cfg.tileSec}|fps:${cfg.fps}|fft:${cfg.fftSize}|max:${cfg.maxHz}|db:${cfg.minDb},${cfg.maxDb}|cmap:${cfg.cmap}|scale:${cfg.freqScale}`;
+}
+function lruTouch(key){
+  const idx = lruOrder.indexOf(key);
+  if (idx >= 0) lruOrder.splice(idx,1);
+  lruOrder.push(key);
+}
+function lruPrune(maxTiles){
+  while (lruOrder.length > maxTiles){
+    const key = lruOrder.shift();
+    const t = tileCache.get(key);
+    if (t?.bitmap) { try { t.bitmap.close?.(); } catch {} }
+    tileCache.delete(key);
+  }
+}
+
+/** ====== Feature bands (for fast scan reuse) ====== */
 function buildFeatureBands(cfg){
   const minHz = Math.max(1, cfg.minHz);
   const maxHz = Math.max(minHz + 1, cfg.maxHz);
@@ -164,25 +237,17 @@ function buildFeatureBands(cfg){
   }
   return edges;
 }
-
 function spectrumToFeatureBands(tmpDb, cfg, edges){
-  // tmpDb is Float32Array of dB per bin
   const sr = analyzer.audioCtx.sampleRate;
   const binHz = sr / cfg.fftSize;
   const bins = tmpDb.length;
   const out = new Uint16Array(FEATURE_BANDS);
-  // store mean dB in each band as uint16 (db*100 + 12000)
   for (let bi=0; bi<FEATURE_BANDS; bi++){
-    const loHz = edges[bi];
-    const hiHz = edges[bi+1];
+    const loHz = edges[bi], hiHz = edges[bi+1];
     const lo = clamp(Math.floor(loHz / binHz), 0, bins-1);
     const hi = clamp(Math.ceil(hiHz / binHz), 0, bins-1);
-    if (hi <= lo){
-      out[bi] = 0;
-      continue;
-    }
-    let sumP = 0;
-    let n = 0;
+    if (hi <= lo){ out[bi] = 0; continue; }
+    let sumP = 0, n = 0;
     for (let i=lo;i<=hi;i++){
       const db = tmpDb[i];
       const p = Math.pow(10, (Math.max(-120, db) / 10));
@@ -190,308 +255,428 @@ function spectrumToFeatureBands(tmpDb, cfg, edges){
     }
     const meanP = sumP / Math.max(1, n);
     const meanDb = 10 * Math.log10(Math.max(1e-12, meanP));
-    const q = clamp(Math.round((meanDb * 100) + 12000), 0, 65535);
-    out[bi] = q;
+    out[bi] = clamp(Math.round((meanDb * 100) + 12000), 0, 65535);
   }
   return out;
 }
-
-function featureBandsToMeanDb(featureBands, cfg, edges, minHz, maxHz){
-  // sum selected bands in linear power, then mean
-  // decode band mean dB -> power, sum, average
-  let sumP = 0;
-  let n = 0;
+function featureBandsToMeanDb(featureBands, edges, minHz, maxHz){
+  let sumP = 0, n = 0;
   for (let bi=0; bi<FEATURE_BANDS; bi++){
-    const loHz = edges[bi];
-    const hiHz = edges[bi+1];
+    const loHz = edges[bi], hiHz = edges[bi+1];
     if (hiHz <= minHz || loHz >= maxHz) continue;
     const db = (featureBands[bi] - 12000) / 100;
-    const p = Math.pow(10, (db / 10));
+    const p = Math.pow(10, db / 10);
     sumP += p; n++;
   }
   if (n <= 0) return -120;
   const meanP = sumP / n;
   return 10 * Math.log10(Math.max(1e-12, meanP));
 }
+function featureBandsPeakDb(featureBands, edges, minHz, maxHz){
+  let best = -120;
+  for (let bi=0; bi<FEATURE_BANDS; bi++){
+    const loHz = edges[bi], hiHz = edges[bi+1];
+    if (hiHz <= minHz || loHz >= maxHz) continue;
+    const db = (featureBands[bi] - 12000) / 100;
+    if (db > best) best = db;
+  }
+  return best;
+}
 
+/** ====== Color maps ====== */
+// return rgb [0..255]
+function lerp(a,b,t){ return a + (b-a)*t; }
+function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+
+function turbo(t){
+  // simple poly approx (not exact, but good enough)
+  t = clamp01(t);
+  const r = clamp01(0.13572138 + 4.61539260*t - 42.66032258*t*t + 132.13108234*t**3 - 152.94239396*t**4 + 59.28637943*t**5);
+  const g = clamp01(0.09140261 + 2.19418839*t + 4.84296658*t*t - 14.18503333*t**3 + 4.27729857*t**4 + 2.82956604*t**5);
+  const b = clamp01(0.10667330 + 11.60249360*t - 87.92710760*t*t + 291.37340000*t**3 - 376.47366000*t**4 + 156.75412000*t**5);
+  return [Math.round(r*255), Math.round(g*255), Math.round(b*255)];
+}
+function magma(t){
+  t = clamp01(t);
+  // rough gradient stops
+  const stops = [
+    [0.0, [0,0,4]],
+    [0.25,[59,15,112]],
+    [0.5, [180,54,121]],
+    [0.75,[251,140,60]],
+    [1.0, [252,253,191]]
+  ];
+  for (let i=0;i<stops.length-1;i++){
+    const [t0,c0]=stops[i], [t1,c1]=stops[i+1];
+    if (t>=t0 && t<=t1){
+      const u=(t-t0)/(t1-t0);
+      return [Math.round(lerp(c0[0],c1[0],u)), Math.round(lerp(c0[1],c1[1],u)), Math.round(lerp(c0[2],c1[2],u))];
+    }
+  }
+  return stops[stops.length-1][1];
+}
+function viridis(t){
+  t = clamp01(t);
+  const stops = [
+    [0.0,[68,1,84]],
+    [0.25,[59,82,139]],
+    [0.5,[33,145,140]],
+    [0.75,[94,201,97]],
+    [1.0,[253,231,37]]
+  ];
+  for (let i=0;i<stops.length-1;i++){
+    const [t0,c0]=stops[i], [t1,c1]=stops[i+1];
+    if (t>=t0 && t<=t1){
+      const u=(t-t0)/(t1-t0);
+      return [Math.round(lerp(c0[0],c1[0],u)), Math.round(lerp(c0[1],c1[1],u)), Math.round(lerp(c0[2],c1[2],u))];
+    }
+  }
+  return stops[stops.length-1][1];
+}
+function grayscale(t){
+  t = clamp01(t);
+  const v = Math.round(t*255);
+  return [v,v,v];
+}
 function mapColor(name, t){
   switch(name){
-    case 'viridis': return viridis(t);
-    case 'magma': return magma(t);
-    case 'grayscale': return grayscale(t);
-    default: return turbo(t);
+    case 'Turbo': return turbo(t);
+    case 'Magma': return magma(t);
+    case 'Viridis': return viridis(t);
+    default: return grayscale(t);
   }
 }
 
-/** ===================== Audio ===================== */
-let analyzer = {
-  file: null,
-  url: null,
-  audio: null,          // analysis audio element
-  audioCtx: null,
-  src: null,
-  analyser: null,
-  gain: null,
-  inited: false,
-  duration: 0,
-  analysisPlaying: false,
-};
+/** ====== Tile generation ====== */
+let abortCtrl = null;
 
-async function ensureFullAudioMetadata(file) {
-  const url = URL.createObjectURL(file);
-  if (UI.fullAudio.dataset.url) { try { URL.revokeObjectURL(UI.fullAudio.dataset.url); } catch {} }
-  UI.fullAudio.dataset.url = url;
-  UI.fullAudio.src = url;
-  UI.fullAudio.preload = 'metadata';
+async function ensureAudioGraph(){
+  if (analyzer.audioCtx) return;
 
-  const duration = await new Promise((resolve, reject) => {
-    const ok = () => { cleanup(); resolve(UI.fullAudio.duration); };
-    const ng = () => { cleanup(); reject(new Error('音声メタデータ読み込みに失敗')); };
-    const cleanup = () => {
-      UI.fullAudio.removeEventListener('loadedmetadata', ok);
-      UI.fullAudio.removeEventListener('error', ng);
-    };
-    UI.fullAudio.addEventListener('loadedmetadata', ok, { once: true });
-    UI.fullAudio.addEventListener('error', ng, { once: true });
-    UI.fullAudio.load();
-  });
-  return duration;
+  analyzer.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  analyzer.analyser = analyzer.audioCtx.createAnalyser();
+  analyzer.analyser.smoothingTimeConstant = 0;
+  analyzer.analyser.minDecibels = -120;
+  analyzer.analyser.maxDecibels = 0;
+
+  analyzer.audio = new Audio();
+  analyzer.audio.preload = 'auto';
+  analyzer.audio.crossOrigin = 'anonymous';
+  analyzer.audio.loop = true; // analysis seeks are easier
+  analyzer.audio.muted = true;
+  analyzer.audio.volume = 0;
+
+  analyzer.srcNode = analyzer.audioCtx.createMediaElementSource(analyzer.audio);
+  analyzer.srcNode.connect(analyzer.analyser);
+  analyzer.analyser.connect(analyzer.audioCtx.destination);
 }
 
-async function initAnalyzerForFile(file) {
-  if (analyzer.url) { try { URL.revokeObjectURL(analyzer.url); } catch {} }
+async function prepare(){
+  const file = UI.fileInput?.files?.[0];
+  if (!file){
+    logLine('ファイルを選択してください');
+    return;
+  }
+
+  clearAll();
+  setState('準備中');
+
+  analyzer.file = file;
   analyzer.url = URL.createObjectURL(file);
 
-  if (!analyzer.audio) analyzer.audio = document.createElement('audio');
+  await ensureAudioGraph();
   analyzer.audio.src = analyzer.url;
-  analyzer.audio.preload = 'auto';
-  analyzer.audio.loop = false;
-  analyzer.audio.volume = 1.0;
-  analyzer.audio.muted = false; // mutedだと解析が止まる環境があるので gain=0で無音化
 
+  // user playback uses fullAudio (separate element) for audible play
+  if (UI.fullAudio){
+    UI.fullAudio.src = analyzer.url;
+    UI.fullAudio.load();
+  }
+
+  // wait metadata
   await new Promise((resolve, reject) => {
-    const ok = () => { cleanup(); resolve(); };
-    const ng = () => { cleanup(); reject(new Error('解析用audioの準備に失敗')); };
+    const onOk = () => { cleanup(); resolve(); };
+    const onNg = (e) => { cleanup(); reject(new Error('metadata load failed')); };
     const cleanup = () => {
-      analyzer.audio.removeEventListener('canplay', ok);
-      analyzer.audio.removeEventListener('error', ng);
+      analyzer.audio.removeEventListener('loadedmetadata', onOk);
+      analyzer.audio.removeEventListener('error', onNg);
     };
-    analyzer.audio.addEventListener('canplay', ok, { once:true });
-    analyzer.audio.addEventListener('error', ng, { once:true });
+    analyzer.audio.addEventListener('loadedmetadata', onOk);
+    analyzer.audio.addEventListener('error', onNg);
     analyzer.audio.load();
   });
 
-  if (!analyzer.audioCtx) {
-    analyzer.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    analyzer.src = analyzer.audioCtx.createMediaElementSource(analyzer.audio);
-    analyzer.analyser = analyzer.audioCtx.createAnalyser();
-    analyzer.gain = analyzer.audioCtx.createGain();
-    analyzer.gain.gain.value = 0.0; // 無音
-    analyzer.src.connect(analyzer.analyser);
-    analyzer.analyser.connect(analyzer.gain);
-    analyzer.gain.connect(analyzer.audioCtx.destination);
-  }
-
-  analyzer.file = file;
+  analyzer.duration = analyzer.audio.duration || 0;
   analyzer.inited = true;
-}
 
-async function ensureAnalysisPlaybackStarted() {
-  if (!analyzer.inited) return;
-  if (analyzer.audioCtx && analyzer.audioCtx.state === 'suspended') {
-    try { await analyzer.audioCtx.resume(); } catch {}
-  }
-  if (analyzer.analysisPlaying) return;
-
-  try {
-    // USER gesture (prepareクリック内)で一回だけ開始
+  // start muted analysis playback once (gesture already happened)
+  try{
+    if (analyzer.audioCtx.state === 'suspended') await analyzer.audioCtx.resume();
     await analyzer.audio.play();
     analyzer.analysisPlaying = true;
-    logLine('解析用再生: START（無音）');
-  } catch (e) {
+  } catch (e){
+    // some browsers still block; will try later at playFrom
     analyzer.analysisPlaying = false;
-    logLine(`解析用再生: START失敗（この場合タイル解析は進みません）: ${e?.message ?? e}`);
+    logLine('分析用の再生開始に失敗（後で再試行します）');
   }
-}
 
-/** ===================== Tile cache (LRU) ===================== */
-const tileCache = new Map();
-let tileInFlight = new Set();
-let abortCtrl = null;
+  // canvas sizing
+  resizeCanvas();
 
-// bird-friendly fixed resolution inside tile bitmap
-const TILE_H = 512;
-const FEATURE_BANDS = 48; // タイル内の周波数を粗くバンド化してスキャン高速化
+  if (UI.playBtn) UI.playBtn.disabled = false;
+  if (UI.pauseBtn) UI.pauseBtn.disabled = false;
+  if (UI.stopBtn) UI.stopBtn.disabled = false;
+  if (UI.exportViewBtn) UI.exportViewBtn.disabled = false;
+  if (UI.exportRangeBtn) UI.exportRangeBtn.disabled = false;
+  if (UI.scanBtn) UI.scanBtn.disabled = false;
 
-
-function makeTileKey(tileIndex, cfg) {
-  return [
-    tileIndex,
-    cfg.fftSize, cfg.fps,
-    cfg.minHz, cfg.maxHz,
-    cfg.minDb, cfg.maxDb,
-    cfg.tileSec,
-    cfg.colorMap,
-    cfg.freqScale
-  ].join('|');
-}
-function lruPrune(maxTiles) {
-  if (tileCache.size <= maxTiles) return;
-  const arr = Array.from(tileCache.entries()).map(([k,v]) => ({k, t:v.lastUsed}));
-  arr.sort((a,b)=>a.t-b.t);
-  const removeCount = tileCache.size - maxTiles;
-  for (let i=0;i<removeCount;i++){
-    const k = arr[i].k;
-    const v = tileCache.get(k);
-    if (v?.bitmap?.close) { try { v.bitmap.close(); } catch {} }
-    tileCache.delete(k);
+  if (UI.meta){
+    UI.meta.textContent = `${file.name} / ${(file.size/1024/1024).toFixed(1)}MB / ${secToHMS(analyzer.duration)}`;
   }
+
+  setState('準備完了');
+  logLine('準備完了。スクロールで表示、停止後にタイル解析します。');
+
+  scheduleRender();
 }
 
-/** ===================== Config ===================== */
-function getConfig() {
-  const fftSize = clamp(parseInt(UI.fftSize.value,10) || 1024, 512, 8192);
-  const fps = clamp(parseInt(UI.fps.value,10) || 60, 10, 120);
-  const minHz = clamp(parseInt(UI.minHz.value,10) || 2000, 0, 24000);
-  const maxHz = clamp(parseInt(UI.maxHz.value,10) || 12000, 0, 24000);
-  const minDb = clamp(parseInt(UI.minDb.value,10) || -100, -120, -10);
-  const maxDb = clamp(parseInt(UI.maxDb.value,10) || -25, -120, 0);
-  const pxPerSec = clamp(parseInt(UI.pxPerSec.value,10) || 120, 20, 400);
-  const tileSec = clamp(parseInt(UI.tileSec.value,10) || 5, 2, 20);
-  const cacheTiles = clamp(parseInt(UI.cacheTiles.value,10) || 80, 10, 300);
-  const colorMap = UI.colorMap.value || 'turbo';
-  const freqScale = UI.freqScale.value || 'log';
-  const bandHighlight = !!UI.bandHighlight.checked;
-  const birdMinHz = clamp(parseInt(UI.birdMinHz.value,10) || 2500, 0, 24000);
-  const birdMaxHz = clamp(parseInt(UI.birdMaxHz.value,10) || 9000, 0, 24000);
-
-  return {
-    fftSize, fps,
-    minHz: Math.min(minHz, maxHz),
-    maxHz: Math.max(minHz, maxHz),
-    minDb: Math.min(minDb, maxDb),
-    maxDb: Math.max(minDb, maxDb),
-    pxPerSec,
-    tileSec,
-    cacheTiles,
-    colorMap,
-    freqScale,
-    bandHighlight,
-    birdMinHz: Math.min(birdMinHz, birdMaxHz),
-    birdMaxHz: Math.max(birdMinHz, birdMaxHz),
-  };
-}
-
-/** ===================== Canvas helpers ===================== */
-const AXIS_W = 62;
-const PAD_T = 10;
-const PAD_B = 14;
-const GRID_ALPHA = 0.18;
-
-function resizeCanvasToViewport() {
-  const vp = UI.viewport.getBoundingClientRect();
-  const w = Math.max(200, Math.floor(vp.width));
-  const h = Math.max(240, Math.floor(vp.height));
-  UI.specCanvas.width = w;
-  UI.specCanvas.height = h;
-}
-
-function hzToY(hz, cfg, plotH) {
-  const minHz = Math.max(1, cfg.minHz);
-  const maxHz = Math.max(minHz+1, cfg.maxHz);
-  let t;
-  if (cfg.freqScale === 'log') {
-    const a = Math.log(minHz);
+function freqToY(cfg, hz, plotH){
+  const maxHz = cfg.maxHz;
+  hz = clamp(hz, 0, maxHz);
+  if (cfg.freqScale === 'log'){
+    const lo = 50;
+    const a = Math.log(lo);
     const b = Math.log(maxHz);
-    t = (Math.log(Math.max(1, hz)) - a) / Math.max(1e-6, (b - a));
+    const x = (Math.log(Math.max(lo, hz)) - a) / (b-a);
+    return plotH - x * plotH;
   } else {
-    t = (hz - minHz) / Math.max(1e-6, (maxHz - minHz));
+    const x = hz / maxHz;
+    return plotH - x * plotH;
   }
-  return PAD_T + (1 - clamp(t,0,1)) * plotH;
 }
 
-function drawAxis(ctx, cfg, plotH, canvasW, canvasH) {
-  ctx.fillStyle = '#f7f7f7';
-  ctx.fillRect(0,0,AXIS_W,canvasH);
+function yToFreq(cfg, y, plotH){
+  const maxHz = cfg.maxHz;
+  const t = 1 - (y / plotH);
+  if (cfg.freqScale === 'log'){
+    const lo = 50;
+    const a = Math.log(lo);
+    const b = Math.log(maxHz);
+    const hz = Math.exp(a + (b-a)*t);
+    return hz;
+  }
+  return t * maxHz;
+}
 
-  ctx.strokeStyle = 'rgba(0,0,0,.08)';
+async function generateTileBitmap(tileIndex, cfg, signal){
+  const tileStart = tileIndex * cfg.tileSec;
+  const width = Math.max(1, Math.floor(cfg.tileSec * cfg.fps));
+  const height = TILE_H;
+
+  analyzer.analyser.fftSize = cfg.fftSize;
+  analyzer.analyser.minDecibels = cfg.minDb;
+  analyzer.analyser.maxDecibels = cfg.maxDb;
+
+  const bins = analyzer.analyser.frequencyBinCount;
+  const tmp = new Float32Array(bins);
+  const featEdges = buildFeatureBands(cfg);
+  const featCols = new Array(width);
+
+  const oc = (typeof OffscreenCanvas !== 'undefined')
+    ? new OffscreenCanvas(width, height)
+    : (() => { const c=document.createElement('canvas'); c.width=width; c.height=height; return c; })();
+  const ctx = oc.getContext('2d', { willReadFrequently: true });
+
+  const img = ctx.createImageData(width, height);
+  const data = img.data;
+
+  // seek
+  analyzer.audio.currentTime = clamp(tileStart, 0, Math.max(0, analyzer.duration - 0.001));
+  await sleep(80);
+
+  // fill columns
+  for (let x=0; x<width; x++){
+    if (signal?.aborted) throw new Error('aborted');
+    const t = tileStart + (x / cfg.fps);
+    if (t >= analyzer.duration) break;
+
+    analyzer.audio.currentTime = t;
+    await sleep(8);
+
+    analyzer.analyser.getFloatFrequencyData(tmp);
+    featCols[x] = spectrumToFeatureBands(tmp, cfg, featEdges);
+
+    for (let y=0; y<height; y++){
+      const hz = yToFreq(cfg, y, height);
+      const binHz = analyzer.audioCtx.sampleRate / cfg.fftSize;
+      const bi = clamp(Math.round(hz / binHz), 0, bins-1);
+      const db = tmp[bi];
+      const v = (db - cfg.minDb) / (cfg.maxDb - cfg.minDb);
+      const tcol = clamp01(v);
+      const rgb = mapColor(cfg.cmap, tcol);
+      const off = (y*width + x) * 4;
+      data[off+0] = rgb[0];
+      data[off+1] = rgb[1];
+      data[off+2] = rgb[2];
+      data[off+3] = 255;
+    }
+  }
+
+  // extend last column to the end to avoid blank
+  for (let x=1; x<width; x++){
+    if (!featCols[x]) featCols[x] = featCols[x-1];
+  }
+
+  ctx.putImageData(img, 0, 0);
+  const bitmap = await createImageBitmap(oc);
+  return { bitmap, width, height, tileIndex, tileStart, tileSec: cfg.tileSec, lastUsed: nowMs(), featEdges, featCols };
+}
+
+/** ====== Rendering ====== */
+let renderQueued = false;
+
+function resizeCanvas(){
+  if (!UI.viewport || !UI.specCanvas) return;
+  const rect = UI.viewport.getBoundingClientRect();
+  UI.specCanvas.width = Math.max(800, Math.floor(rect.width));
+  UI.specCanvas.height = Math.max(300, Math.floor(rect.height));
+}
+
+function getViewportRange(cfg){
+  const vw = UI.specCanvas.width - AXIS_W;
+  const startSec = (UI.viewport.scrollLeft / cfg.pxPerSec);
+  const endSec = startSec + Math.max(0.1, vw / cfg.pxPerSec);
+  return { startSec, endSec };
+}
+
+function scheduleRender(){
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    renderViewport();
+  });
+}
+
+async function ensureTilesForRange(cfg, range){
+  if (!analyzer.inited) return;
+  const startIdx0 = Math.floor(range.startSec / cfg.tileSec);
+  const endIdx0 = Math.floor(range.endSec / cfg.tileSec);
+
+  const startIdx = Math.max(0, startIdx0 - PREFETCH_TILES);
+  const endIdx = Math.min(Math.floor(analyzer.duration / cfg.tileSec), endIdx0 + PREFETCH_TILES);
+
+  if (UI.tileInfo){
+    UI.tileInfo.textContent = `tile: view ${startIdx0}-${endIdx0} / prefetch ${startIdx}-${endIdx} / cache ${tileCache.size}`;
+  }
+  lruPrune(cfg.cacheTiles);
+
+  const cfgPrev = getPreviewConfig(cfg);
+
+  // priority: view preview -> view full -> prefetch preview -> prefetch full
+  const want = [];
+  for (let ti=startIdx0; ti<=endIdx0; ti++) want.push({ti, cfg: cfgPrev});
+  for (let ti=startIdx0; ti<=endIdx0; ti++) want.push({ti, cfg: cfg});
+  for (let ti=startIdx; ti<=endIdx; ti++) want.push({ti, cfg: cfgPrev});
+  for (let ti=startIdx; ti<=endIdx; ti++) want.push({ti, cfg: cfg});
+
+  for (const w of want){
+    if (abortCtrl?.signal?.aborted) return;
+    const key = makeTileKey(w.ti, w.cfg);
+    if (tileCache.has(key)) { lruTouch(key); continue; }
+    if (tileInFlight.has(key)) continue;
+    if (tileInFlight.size >= 1) return;
+
+    tileInFlight.add(key);
+    (async ()=>{
+      try{
+        logLine(`tile#${w.ti} gen start (fps=${w.cfg.fps})`);
+        const tile = await generateTileBitmap(w.ti, w.cfg, abortCtrl?.signal);
+        tileCache.set(key, tile);
+        lruTouch(key);
+        logLine(`tile#${w.ti} gen ok`);
+      } catch(e){
+        logLine(`tile#${w.ti} gen fail: ${e?.message ?? e}`);
+      } finally {
+        tileInFlight.delete(key);
+        scheduleRender();
+      }
+    })();
+    return;
+  }
+}
+
+function drawAxis(ctx, cfg, plotH, cw, ch){
+  ctx.save();
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,AXIS_W,ch);
+
+  ctx.strokeStyle = 'rgba(0,0,0,.12)';
   ctx.beginPath();
-  ctx.moveTo(AXIS_W + 0.5, 0);
-  ctx.lineTo(AXIS_W + 0.5, canvasH);
+  ctx.moveTo(AXIS_W+0.5,0);
+  ctx.lineTo(AXIS_W+0.5,ch);
   ctx.stroke();
 
-  const range = cfg.maxHz - cfg.minHz;
-  const step = (range <= 6000) ? 500 : 1000;
+  ctx.fillStyle = '#111827';
+  ctx.font = '12px ' + (getComputedStyle(document.body).getPropertyValue('--mono') || 'monospace');
 
-  ctx.fillStyle = 'rgba(0,0,0,.70)';
-  ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
-  ctx.strokeStyle = `rgba(0,0,0,${GRID_ALPHA})`;
-  ctx.lineWidth = 1;
-
-  for (let hz = Math.ceil(cfg.minHz/step)*step; hz <= cfg.maxHz; hz += step) {
-    const y = hzToY(hz, cfg, plotH);
+  // kHz ticks
+  const ticks = [1,2,3,4,6,8,10,12,14,16,18,20,24].map(k=>k*1000).filter(hz=>hz<=cfg.maxHz);
+  for (const hz of ticks){
+    const y = PAD_T + freqToY(cfg, hz, plotH);
+    ctx.strokeStyle = 'rgba(0,0,0,.10)';
     ctx.beginPath();
-    ctx.moveTo(AXIS_W, y + 0.5);
-    ctx.lineTo(canvasW, y + 0.5);
+    ctx.moveTo(0,y+0.5);
+    ctx.lineTo(AXIS_W,y+0.5);
     ctx.stroke();
-
-    const khz = (hz/1000).toFixed(step===500 ? 1 : 0);
-    ctx.fillText(`${khz}`, 10, y + 4);
+    const txt = (hz/1000).toFixed(0) + 'k';
+    ctx.fillText(txt, 8, y+4);
   }
-
-  ctx.fillStyle = 'rgba(0,0,0,.55)';
-  ctx.fillText('kHz', 10, 16);
+  ctx.restore();
 }
 
-function drawTimeTopGrid(ctx, cfg, viewStartSec, viewEndSec, canvasW, canvasH) {
-  const plotX0 = AXIS_W;
-  const spanSec = (viewEndSec - viewStartSec);
-  const step = (spanSec <= 20) ? 1 : (spanSec <= 120 ? 5 : 10);
-
+function drawTimeTopGrid(ctx, cfg, startSec, endSec, cw, ch){
   ctx.save();
-  ctx.strokeStyle = `rgba(0,0,0,${GRID_ALPHA})`;
-  ctx.lineWidth = 1;
-
-  const first = Math.floor(viewStartSec/step)*step;
-  for (let t=first; t<=viewEndSec; t+=step){
-    const x = plotX0 + (t - viewStartSec) * cfg.pxPerSec;
+  ctx.strokeStyle = 'rgba(255,255,255,.08)';
+  ctx.fillStyle = 'rgba(255,255,255,.16)';
+  ctx.font = '12px ' + (getComputedStyle(document.body).getPropertyValue('--mono') || 'monospace');
+  const span = endSec - startSec;
+  const step = span > 120 ? 10 : span > 60 ? 5 : span > 20 ? 2 : 1;
+  for (let s=Math.floor(startSec/step)*step; s<=endSec; s+=step){
+    const x = AXIS_W + (s-startSec)*cfg.pxPerSec;
     ctx.beginPath();
     ctx.moveTo(x+0.5, 0);
-    ctx.lineTo(x+0.5, canvasH);
+    ctx.lineTo(x+0.5, ch);
     ctx.stroke();
-  }
-  ctx.restore();
-
-  ctx.save();
-  ctx.fillStyle = 'rgba(0,0,0,.60)';
-  ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
-  for (let t=first; t<=viewEndSec; t+=step){
-    const x = plotX0 + (t - viewStartSec) * cfg.pxPerSec;
-    ctx.fillText(secToHMS(t), x + 6, 16);
+    ctx.fillText(secToHMS(s), x+4, 14);
   }
   ctx.restore();
 }
 
-function drawBandHighlight(ctx, cfg, plotH, canvasW) {
-  if (!cfg.bandHighlight) return;
-  const y1 = hzToY(cfg.birdMaxHz, cfg, plotH);
-  const y2 = hzToY(cfg.birdMinHz, cfg, plotH);
-  const top = Math.min(y1,y2);
-  const h = Math.max(2, Math.abs(y2-y1));
+function drawBandHighlight(ctx, cfg, plotH, cw){
   ctx.save();
-  ctx.fillStyle = 'rgba(255, 230, 0, 0.10)';
-  ctx.fillRect(AXIS_W, top, canvasW-AXIS_W, h);
-  ctx.strokeStyle = 'rgba(255, 230, 0, 0.35)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(AXIS_W+0.5, top+0.5, canvasW-AXIS_W-1, h-1);
+  const y0 = PAD_T + freqToY(cfg, cfg.hlMaxHz, plotH);
+  const y1 = PAD_T + freqToY(cfg, cfg.hlMinHz, plotH);
+  ctx.fillStyle = 'rgba(94,234,212,.08)';
+  ctx.fillRect(AXIS_W, y0, cw-AXIS_W, Math.max(1, y1-y0));
   ctx.restore();
 }
 
+function drawPlayhead(ctx, cfg, viewStartSec, t, cw, ch){
+  const x = AXIS_W + (t - viewStartSec) * cfg.pxPerSec;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,80,80,.95)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x+0.5, 0);
+  ctx.lineTo(x+0.5, ch);
+  ctx.stroke();
+  ctx.restore();
+}
 
-function drawDetectionsOverlay(ctx, cfg, viewStartSec, viewEndSec, canvasW, canvasH){
+function drawDetectionsOverlay(ctx, cfg, viewStartSec, viewEndSec, cw, ch){
   if (!scanHits || scanHits.length === 0) return;
   ctx.save();
-  // region fill
   ctx.fillStyle = 'rgba(255, 80, 80, 0.10)';
   ctx.strokeStyle = 'rgba(255, 80, 80, 0.55)';
   ctx.lineWidth = 1;
@@ -500,177 +685,213 @@ function drawDetectionsOverlay(ctx, cfg, viewStartSec, viewEndSec, canvasW, canv
     if (h.end < viewStartSec || h.start > viewEndSec) continue;
     const x0 = AXIS_W + (Math.max(h.start, viewStartSec) - viewStartSec) * cfg.pxPerSec;
     const x1 = AXIS_W + (Math.min(h.end, viewEndSec) - viewStartSec) * cfg.pxPerSec;
-    const w = Math.max(1, x1 - x0);
-    ctx.fillRect(x0, 0, w, canvasH);
-    // peak line
+    ctx.fillRect(x0, 0, Math.max(1, x1-x0), ch);
     const xp = AXIS_W + (clamp(h.peakTime, viewStartSec, viewEndSec) - viewStartSec) * cfg.pxPerSec;
     ctx.beginPath();
-    ctx.moveTo(xp + 0.5, 0);
-    ctx.lineTo(xp + 0.5, canvasH);
+    ctx.moveTo(xp+0.5, 0);
+    ctx.lineTo(xp+0.5, ch);
     ctx.stroke();
   }
   ctx.restore();
 }
 
-function drawPlayhead(ctx, cfg, viewStartSec, currentTimeSec, canvasW, canvasH) {
-  const x = AXIS_W + (currentTimeSec - viewStartSec) * cfg.pxPerSec;
-  if (x < AXIS_W || x > canvasW) return;
-  ctx.save();
-  ctx.strokeStyle = 'rgba(255,0,0,.85)';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(x+0.5, 0);
-  ctx.lineTo(x+0.5, canvasH);
-  ctx.stroke();
-  ctx.restore();
-}
+function renderViewport(){
+  if (!UI.specCanvas || !UI.viewport) return;
+  const ctx = UI.specCanvas.getContext('2d', { alpha:false });
 
-function getVisibleTimeRange(cfg) {
-  const scrollLeft = UI.viewport.scrollLeft;
-  const viewW = UI.viewport.clientWidth;
-  const startSec = scrollLeft / cfg.pxPerSec;
-  const endSec = (scrollLeft + viewW) / cfg.pxPerSec;
-  return { startSec, endSec };
-}
+  const cfg = getConfig();
+  const range = getViewportRange(cfg);
+  const cw = UI.specCanvas.width;
+  const ch = UI.specCanvas.height;
+  const plotH = ch - PAD_T - PAD_B;
 
-/** ===================== Tile generation (NO play() per tile) ===================== */
-function yToHzByScale(y, cfg, height){
-  const t = 1 - (y / Math.max(1, (height - 1))); // 0 bottom -> min, 1 top -> max
-  const minHz = Math.max(1, cfg.minHz);
-  const maxHz = Math.max(minHz+1, cfg.maxHz);
-  if (cfg.freqScale === 'log'){
-    const a = Math.log(minHz);
-    const b = Math.log(maxHz);
-    return Math.exp(a + (b-a)*t);
+  // background
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,cw,ch);
+
+  drawAxis(ctx, cfg, plotH, cw, ch);
+  drawTimeTopGrid(ctx, cfg, range.startSec, range.endSec, cw, ch);
+  drawBandHighlight(ctx, cfg, plotH, cw);
+
+  // tiles
+  const startIdx = Math.floor(range.startSec / cfg.tileSec);
+  const endIdx = Math.floor(range.endSec / cfg.tileSec);
+
+  for (let ti=startIdx; ti<=endIdx; ti++){
+    const keyFull = makeTileKey(ti, cfg);
+    let tile = tileCache.get(keyFull);
+    if (!tile){
+      const cfgPrev = getPreviewConfig(cfg);
+      const keyPrev = makeTileKey(ti, cfgPrev);
+      tile = tileCache.get(keyPrev);
+    }
+    if (!tile) continue;
+
+    const tileStart = ti * cfg.tileSec;
+    const tileEnd = tileStart + cfg.tileSec;
+    const drawStart = Math.max(range.startSec, tileStart);
+    const drawEnd = Math.min(range.endSec, tileEnd);
+    if (drawEnd <= drawStart) continue;
+
+    const srcX0 = (drawStart - tileStart) * cfg.fps;
+    const srcX1 = (drawEnd - tileStart) * cfg.fps;
+    const srcW = Math.max(1, srcX1 - srcX0);
+
+    const dstX0 = AXIS_W + (drawStart - range.startSec) * cfg.pxPerSec;
+    const dstW = (drawEnd - drawStart) * cfg.pxPerSec;
+
+    ctx.drawImage(tile.bitmap, srcX0, 0, srcW, tile.height, dstX0, PAD_T, dstW, plotH);
   }
-  return minHz + (maxHz - minHz) * t;
+
+  drawDetectionsOverlay(ctx, cfg, range.startSec, range.endSec, cw, ch);
+
+  const t = UI.fullAudio?.currentTime || 0;
+  drawPlayhead(ctx, cfg, range.startSec, t, cw, ch);
+
+  if (UI.viewportInfo){
+    UI.viewportInfo.textContent = `view: ${secToHMS(range.startSec)}–${secToHMS(range.endSec)} / zoom ${cfg.pxPerSec}px/s`;
+  }
+
+  // schedule tile generation (debounced by scroll idle, but calling here is safe)
+  if (!abortCtrl) abortCtrl = new AbortController();
+  ensureTilesForRange(cfg, range);
 }
 
-async function generateTileBitmap(tileIndex, cfg, abortSignal) {
-  // Require analysis playback already started
-  if (!analyzer.analysisPlaying) throw new Error('解析用再生が開始できていません（prepare後にブロック）');
+/** ====== Seek / Playback ====== */
+async function playFrom(sec){
+  if (!analyzer.inited || !UI.fullAudio) return;
+  sec = clamp(sec, 0, Math.max(0, analyzer.duration - 0.001));
 
-  const tileStart = tileIndex * cfg.tileSec;
-  const tileEnd = Math.min(analyzer.duration, tileStart + cfg.tileSec);
-  const targetSeconds = tileEnd - tileStart;
+  // ensure audio ctx resumed
+  try { if (analyzer.audioCtx?.state === 'suspended') await analyzer.audioCtx.resume(); } catch {}
 
-  analyzer.analyser.fftSize = cfg.fftSize;
-  analyzer.analyser.smoothingTimeConstant = 0;
-  analyzer.analyser.minDecibels = cfg.minDb;
-  analyzer.analyser.maxDecibels = cfg.maxDb;
+  // ensure analysis loop running (muted)
+  if (!analyzer.analysisPlaying){
+    try{
+      await analyzer.audio.play();
+      analyzer.analysisPlaying = true;
+    } catch {}
+  }
 
-  const bins = analyzer.analyser.frequencyBinCount;
-  const tmp = new Float32Array(bins);
-  const binHz = analyzer.audioCtx.sampleRate / cfg.fftSize;
-  const featEdges = buildFeatureBands(cfg);
-  const featCols = new Array(width); // each is Uint16Array(FEATURE_BANDS)
+  // audible playback uses fullAudio
+  UI.fullAudio.currentTime = sec;
+  try{ await UI.fullAudio.play(); } catch {}
+  scheduleRender();
+}
 
-  const width = Math.max(1, Math.floor(targetSeconds * cfg.fps));
-  const height = TILE_H;
-  const hopMs = 1000 / cfg.fps;
-
-  const oc = (typeof OffscreenCanvas !== 'undefined')
-    ? new OffscreenCanvas(width, height)
-    : (() => { const c=document.createElement('canvas'); c.width=width; c.height=height; return c; })();
-  const ctx = oc.getContext('2d', { willReadFrequently:false });
-  const img = ctx.createImageData(width, height);
-  const data = img.data;
-
-  const invRange = 1.0 / Math.max(1e-6, (cfg.maxDb - cfg.minDb));
-
-  let stop = false;
-  const onAbort = () => { stop = true; };
-  abortSignal?.addEventListener('abort', onAbort, { once:true });
-
-  try {
-    // seek while playing
-    analyzer.audio.currentTime = Math.max(0, tileStart);
-    await sleep(120); // wait for seek settle
-
-    const startT = nowMs();
-    let nextSample = startT;
-    let x = 0;
-
-    while (!stop && x < width) {
-      const now = nowMs();
-      const elapsed = (now - startT)/1000;
-      if (elapsed >= targetSeconds) break;
-
-      if (now >= nextSample) {
-        analyzer.analyser.getFloatFrequencyData(tmp);
-        featCols[x] = spectrumToFeatureBands(tmp, cfg, featEdges);
-
-        for (let y=0; y<height; y++){
-          const hz = yToHzByScale(y, cfg, height);
-          const bin = clamp(Math.round(hz / binHz), 0, bins-1);
-          const db = tmp[bin];
-          const norm = clamp((db - cfg.minDb) * invRange, 0, 1);
-          const [r,g,b] = mapColor(cfg.colorMap, norm);
-          const idx = (y * width + x) * 4;
-          data[idx+0] = r;
-          data[idx+1] = g;
-          data[idx+2] = b;
-          data[idx+3] = 255;
-        }
-
-        x++;
-        nextSample += hopMs;
-      }
-      await sleep(6);
-    }
-
-    // extend last col to avoid blank tail
-    if (x > 0 && x < width) {
-      // extend features too
-      const lastFeat = featCols[x-1];
-      for (let fillX = x; fillX < width; fillX++){ featCols[fillX] = lastFeat; }
-
-      const lastCol = x-1;
-      for (let fillX = x; fillX < width; fillX++){
-        for (let y=0; y<height; y++){
-          const src = (y * width + lastCol) * 4;
-          const dst = (y * width + fillX) * 4;
-          data[dst+0]=data[src+0];
-          data[dst+1]=data[src+1];
-          data[dst+2]=data[src+2];
-          data[dst+3]=255;
-        }
-      }
-    }
-
-    ctx.putImageData(img, 0, 0);
-    const bitmap = await createImageBitmap(oc);
-    return { bitmap, width, height, tileIndex, tileStart, tileSec: cfg.tileSec, lastUsed: nowMs(), featEdges, featCols };
+/** ====== PNG export ====== */
+async function exportVisiblePNG(){
+  if (!analyzer.inited || !UI.specCanvas) return;
+  setState('PNG作成中');
+  if (UI.exportViewBtn) UI.exportViewBtn.disabled = true;
+  try{
+    const blob = await new Promise(r => UI.specCanvas.toBlob(r, 'image/png'));
+    const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+    downloadBlob(blob, `spectrogram_view_${stamp}.png`);
+    setState('準備完了');
+  } catch(e){
+    setState('エラー');
+    logLine(`PNG(表示)失敗: ${e?.message ?? e}`);
   } finally {
-    abortSignal?.removeEventListener('abort', onAbort);
+    if (UI.exportViewBtn) UI.exportViewBtn.disabled = false;
   }
 }
 
-/** ===================== Rendering ===================== */
+function renderRangeToCanvas(targetCanvas, cfg, startSec, endSec){
+  const ctx = targetCanvas.getContext('2d', { alpha:false });
+  const cw = targetCanvas.width, ch = targetCanvas.height;
+  const plotH = ch - PAD_T - PAD_B;
 
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,cw,ch);
+
+  drawAxis(ctx, cfg, plotH, cw, ch);
+  drawTimeTopGrid(ctx, cfg, startSec, endSec, cw, ch);
+  drawBandHighlight(ctx, cfg, plotH, cw);
+
+  const startIdx = Math.floor(startSec / cfg.tileSec);
+  const endIdx = Math.floor(endSec / cfg.tileSec);
+
+  for (let ti=startIdx; ti<=endIdx; ti++){
+    const keyFull = makeTileKey(ti, cfg);
+    const tile = tileCache.get(keyFull);
+    if (!tile) continue;
+
+    const tileStart = ti * cfg.tileSec;
+    const tileEnd = tileStart + cfg.tileSec;
+    const drawStart = Math.max(startSec, tileStart);
+    const drawEnd = Math.min(endSec, tileEnd);
+    if (drawEnd <= drawStart) continue;
+
+    const srcX0 = (drawStart - tileStart) * cfg.fps;
+    const srcX1 = (drawEnd - tileStart) * cfg.fps;
+    const srcW = Math.max(1, srcX1 - srcX0);
+
+    const dstX0 = AXIS_W + (drawStart - startSec) * cfg.pxPerSec;
+    const dstW = (drawEnd - drawStart) * cfg.pxPerSec;
+
+    ctx.drawImage(tile.bitmap, srcX0, 0, srcW, tile.height, dstX0, PAD_T, dstW, plotH);
+  }
+
+  drawDetectionsOverlay(ctx, cfg, startSec, endSec, cw, ch);
+  const t = UI.fullAudio?.currentTime || 0;
+  drawPlayhead(ctx, cfg, startSec, t, cw, ch);
+}
+
+async function exportRangePNG(){
+  if (!analyzer.inited) return;
+  setState('PNG作成中');
+  if (UI.exportRangeBtn) UI.exportRangeBtn.disabled = true;
+  try{
+    const cfg0 = getConfig();
+    const s = clamp(parseFloat(UI.exportStartSec?.value) || 0, 0, analyzer.duration);
+    const e = clamp(parseFloat(UI.exportEndSec?.value) || Math.min(analyzer.duration, s+30), 0, analyzer.duration);
+    const start = Math.min(s,e), end = Math.max(s,e);
+    const span = Math.max(0.1, end-start);
+
+    const desiredW = Math.floor(span * cfg0.pxPerSec) + AXIS_W;
+    const maxW = 8000;
+    const scale = desiredW > maxW ? (maxW / desiredW) : 1.0;
+
+    const rect = UI.viewport.getBoundingClientRect();
+    const h = Math.max(300, Math.floor(rect.height));
+    const w = Math.max(800, Math.floor(desiredW * scale));
+
+    const oc = (typeof OffscreenCanvas !== 'undefined')
+      ? new OffscreenCanvas(w, h)
+      : (() => { const c=document.createElement('canvas'); c.width=w; c.height=h; return c; })();
+
+    const cfg = { ...cfg0, pxPerSec: cfg0.pxPerSec * scale };
+    renderRangeToCanvas(oc, cfg, start, end);
+
+    const blob = await (oc.convertToBlob ? oc.convertToBlob({type:'image/png'}) : new Promise(r => oc.toBlob(r, 'image/png')));
+    const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+    downloadBlob(blob, `spectrogram_${Math.floor(start)}-${Math.floor(end)}s_${stamp}.png`);
+    setState('準備完了');
+  } catch(e){
+    setState('エラー');
+    logLine(`PNG(範囲)失敗: ${e?.message ?? e}`);
+  } finally {
+    if (UI.exportRangeBtn) UI.exportRangeBtn.disabled = false;
+  }
+}
+
+/** ====== Scan (trigger detection) ====== */
 let scanAbort = null;
-let scanRunning = false;
 let scanHits = []; // {start,end,peakDb,peakTime}
 
 function setScanUI(running){
-  scanRunning = running;
   if (UI.scanBtn) UI.scanBtn.disabled = !analyzer.inited || running;
   if (UI.scanStopBtn) UI.scanStopBtn.disabled = !running;
-  if (UI.scanMinHz) UI.scanMinHz.disabled = running;
-  if (UI.scanMaxHz) UI.scanMaxHz.disabled = running;
-  if (UI.scanThresholdDb) UI.scanThresholdDb.disabled = running;
-  if (UI.scanStepSec) UI.scanStepSec.disabled = running;
-  if (UI.presetSmallBird) UI.presetSmallBird.disabled = running;
-  if (UI.presetRaptor) UI.presetRaptor.disabled = running;
-  if (UI.presetAll) UI.presetAll.disabled = running;
+  for (const el of [UI.scanMinHz, UI.scanMaxHz, UI.scanThresholdDb, UI.scanStepSec, UI.presetSmallBird, UI.presetRaptor, UI.presetAll]){
+    if (el) el.disabled = running;
+  }
 }
-
 function updateDetectList(){
-  if (!UI.detectCount || !UI.detectList) return;
-  UI.detectCount.textContent = `${scanHits.length}件`;
+  if (UI.detectCount) UI.detectCount.textContent = `${scanHits.length}件`;
+  if (!UI.detectList) return;
   UI.detectList.innerHTML = '';
-  for (let i=0;i<scanHits.length;i++){
-    const h = scanHits[i];
+  for (const h of scanHits){
     const div = document.createElement('div');
     div.className = 'hit';
     const t = document.createElement('div');
@@ -679,8 +900,7 @@ function updateDetectList(){
     const v = document.createElement('div');
     v.className = 'v mono';
     v.textContent = `peak:${h.peakDb.toFixed(1)}dB`;
-    div.appendChild(t);
-    div.appendChild(v);
+    div.appendChild(t); div.appendChild(v);
     div.addEventListener('click', async () => {
       const cfg = getConfig();
       const x = h.start * cfg.pxPerSec;
@@ -699,37 +919,31 @@ function bandMeanDbFromSpectrum(tmpDb, cfg, minHz, maxHz){
   const hi = clamp(Math.ceil(maxHz / binHz), 0, bins-1);
   if (hi <= lo) return -120;
 
-  let sumP = 0;
-  let n = 0;
+  let sumP = 0, n = 0;
   for (let i=lo;i<=hi;i++){
     const db = tmpDb[i];
     const p = Math.pow(10, (Math.max(-120, db) / 10));
-    sumP += p;
-    n++;
+    sumP += p; n++;
   }
-  const meanP = sumP / Math.max(1, n);
-  const meanDb = 10 * Math.log10(Math.max(1e-12, meanP));
-  return meanDb;
+  const meanP = sumP / Math.max(1,n);
+  return 10 * Math.log10(Math.max(1e-12, meanP));
 }
 
 async function runScanAsync(){
   if (!analyzer.inited) return;
-  if (!analyzer.analysisPlaying){
-    logLine('スキャン前に「読み込み/準備」で解析用再生を開始してください');
-    return;
-  }
 
   const cfg = getConfig();
-  const scanMinHz = clamp(parseInt(UI.scanMinHz.value,10) || 3000, 0, 24000);
-  const scanMaxHzUser = UI.scanMaxHz ? clamp(parseInt(UI.scanMaxHz.value,10) || cfg.maxHz, 0, 24000) : cfg.maxHz;
-  const scanMaxHz = Math.max(scanMinHz, Math.min(cfg.maxHz, scanMaxHzUser));
-  const thresholdDb = clamp(parseInt(UI.scanThresholdDb.value,10) || -55, -120, 0);
-  const stepSec = clamp(parseFloat(UI.scanStepSec.value) || 0.5, 0.1, 2.0);
+  const minHz = clamp(parseInt(UI.scanMinHz?.value || '3000', 10), 0, 24000);
+  const maxHzU = clamp(parseInt(UI.scanMaxHz?.value || String(cfg.maxHz), 10), 0, 24000);
+  const maxHz = Math.max(minHz, Math.min(cfg.maxHz, maxHzU));
+  const thr = clamp(parseInt(UI.scanThresholdDb?.value || '-55', 10), -120, 0);
+  const stepSec = clamp(parseFloat(UI.scanStepSec?.value || '0.5'), 0.1, 2.0);
 
+  // setup analyser
   analyzer.analyser.fftSize = cfg.fftSize;
-  analyzer.analyser.smoothingTimeConstant = 0;
   analyzer.analyser.minDecibels = cfg.minDb;
   analyzer.analyser.maxDecibels = cfg.maxDb;
+  analyzer.analyser.smoothingTimeConstant = 0;
 
   const bins = analyzer.analyser.frequencyBinCount;
   const tmp = new Float32Array(bins);
@@ -737,7 +951,7 @@ async function runScanAsync(){
   scanHits = [];
   updateDetectList();
   if (UI.scanBarFill) UI.scanBarFill.style.width = '0%';
-  if (UI.scanStatus) UI.scanStatus.textContent = `scan: 0/${secToHMS(analyzer.duration)} step=${stepSec}s band=${scanMinHz}-${scanMaxHz}Hz thr=${thresholdDb}dB`;
+  if (UI.scanStatus) UI.scanStatus.textContent = `scan: 0/${secToHMS(analyzer.duration)} step=${stepSec}s band=${minHz}-${maxHz}Hz thr=${thr}dB`;
 
   scanAbort = new AbortController();
   setScanUI(true);
@@ -750,15 +964,17 @@ async function runScanAsync(){
     let t = 0;
     let iter = 0;
 
-    analyzer.audio.currentTime = 0;
-    await sleep(120);
+    // ensure analysis loop running
+    if (!analyzer.analysisPlaying){
+      try { await analyzer.audio.play(); analyzer.analysisPlaying = true; } catch {}
+    }
 
     while (t < dur){
       if (scanAbort.signal.aborted) break;
 
-      // 既にタイルが生成済みなら（featCols）を再利用して高速判定
+      // reuse: if tile exists, use its feature bands
       let meanDb = null;
-      let peak = null;
+      let peakDb = null;
 
       const ti = Math.floor(t / cfg.tileSec);
       const key = makeTileKey(ti, cfg);
@@ -767,50 +983,36 @@ async function runScanAsync(){
         const col = Math.floor((t - (ti*cfg.tileSec)) * cfg.fps);
         const idx = clamp(col, 0, tile.featCols.length - 1);
         const fb = tile.featCols[idx];
-        meanDb = featureBandsToMeanDb(fb, cfg, tile.featEdges, scanMinHz, scanMaxHz);
-
-        // peak推定: 選択バンド内で最大dB
-        let best = -120;
-        for (let bi=0; bi<FEATURE_BANDS; bi++){
-          const loHz = tile.featEdges[bi];
-          const hiHz = tile.featEdges[bi+1];
-          if (hiHz <= scanMinHz || loHz >= scanMaxHz) continue;
-          const db = (fb[bi] - 12000) / 100;
-          if (db > best) best = db;
-        }
-        peak = best;
+        meanDb = featureBandsToMeanDb(fb, tile.featEdges, minHz, maxHz);
+        peakDb = featureBandsPeakDb(fb, tile.featEdges, minHz, maxHz);
       }
 
       if (meanDb === null){
         analyzer.audio.currentTime = t;
         await sleep(80);
         analyzer.analyser.getFloatFrequencyData(tmp);
-        meanDb = bandMeanDbFromSpectrum(tmp, cfg, scanMinHz, scanMaxHz);
+        meanDb = bandMeanDbFromSpectrum(tmp, cfg, minHz, maxHz);
 
-        // peak db in band for display
+        // peak for display
         const sr = analyzer.audioCtx.sampleRate;
         const binHz = sr / cfg.fftSize;
-        const lo = clamp(Math.floor(scanMinHz / binHz), 0, bins-1);
-        const hi = clamp(Math.ceil(scanMaxHz / binHz), 0, bins-1);
+        const lo = clamp(Math.floor(minHz / binHz), 0, bins-1);
+        const hi = clamp(Math.ceil(maxHz / binHz), 0, bins-1);
         let pk = -120;
-        for (let i=lo;i<=hi;i++){
-          const db = tmp[i];
-          if (db > pk) pk = db;
-        }
-        peak = pk;
+        for (let i=lo;i<=hi;i++) pk = Math.max(pk, tmp[i]);
+        peakDb = pk;
       }
 
-      if (meanDb >= thresholdDb){
-        const peakDbVal = (peak === null || peak === undefined) ? meanDb : peak;
-
+      if (meanDb >= thr){
+        const peak = (peakDb ?? meanDb);
         if (!cur){
-          cur = { start: t, end: t, peakDb: peakDbVal, peakTime: t };
+          cur = { start: t, end: t, peakDb: peak, peakTime: t };
         } else if (t - cur.end <= groupGap){
           cur.end = t;
-          if (peakDbVal > cur.peakDb){ cur.peakDb = peakDbVal; cur.peakTime = t; }
+          if (peak > cur.peakDb){ cur.peakDb = peak; cur.peakTime = t; }
         } else {
           scanHits.push({ ...cur, end: Math.min(cur.end + stepSec, dur) });
-          cur = { start: t, end: t, peakDb: peakDbVal, peakTime: t };
+          cur = { start: t, end: t, peakDb: peak, peakTime: t };
         }
       }
 
@@ -822,6 +1024,7 @@ async function runScanAsync(){
         if (UI.scanBarFill) UI.scanBarFill.style.width = `${(p*100).toFixed(1)}%`;
         if (UI.scanStatus) UI.scanStatus.textContent = `scan: ${secToHMS(t)}/${secToHMS(dur)} hits=${scanHits.length}${cur?'+':''}`;
         await sleep(0);
+        scheduleRender();
       }
     }
 
@@ -831,472 +1034,87 @@ async function runScanAsync(){
     if (UI.scanBarFill) UI.scanBarFill.style.width = '100%';
     if (UI.scanStatus) UI.scanStatus.textContent = `scan: 完了 hits=${scanHits.length}`;
     setState('準備完了');
-    logLine(`スキャン完了: ${scanHits.length}件`);
+    logLine(`scan done: ${scanHits.length} hits`);
+    scheduleRender();
   } catch(e){
     setState('エラー');
-    logLine(`スキャン失敗: ${e?.message ?? e}`);
+    logLine(`scan fail: ${e?.message ?? e}`);
   } finally {
     setScanUI(false);
     scanAbort = null;
   }
 }
 
-let renderQueued = false;
-let playingRaf = 0;
+/** ====== UI wiring ====== */
+function wire(){
+  if (UI.clearBtn) UI.clearBtn.addEventListener('click', clearAll);
 
-function scheduleRender() {
-  if (renderQueued) return;
-  renderQueued = true;
-  requestAnimationFrame(() => {
-    renderQueued = false;
-    renderViewport(UI.specCanvas);
+  if (UI.prepareBtn) UI.prepareBtn.addEventListener('click', async () => {
+    try{
+      UI.prepareBtn.disabled = true;
+      await prepare();
+    } catch(e){
+      setState('エラー');
+      logLine(`prepare fail: ${e?.message ?? e}`);
+    } finally {
+      UI.prepareBtn.disabled = false;
+    }
   });
-}
 
-function updateLabels(range) {
-  UI.viewLabel.textContent = `${secToHMS(range.startSec)} - ${secToHMS(range.endSec)}`;
-}
-
-async function ensureTilesForRange(cfg, range) {
-  const startIdx = Math.floor(range.startSec / cfg.tileSec);
-  const endIdx = Math.floor(range.endSec / cfg.tileSec);
-
-  UI.tileLabel.textContent = `${startIdx}..${endIdx}（cache:${tileCache.size} / inflight:${tileInFlight.size}）`;
-  lruPrune(cfg.cacheTiles);
-
-  for (let ti = startIdx; ti <= endIdx; ti++) {
-    if (abortCtrl?.signal?.aborted) return;
-
-    const key = makeTileKey(ti, cfg);
-    const hit = tileCache.get(key);
-    if (hit) { hit.lastUsed = nowMs(); continue; }
-    if (tileInFlight.has(key)) continue;
-
-    // throttle inflight (1 is safest because we are seeking a single audio element)
-    if (tileInFlight.size >= 1) continue;
-
-    tileInFlight.add(key);
-    (async () => {
-      try {
-        logLine(`tile#${ti} 生成開始`);
-        const tile = await generateTileBitmap(ti, cfg, abortCtrl?.signal);
-        tileCache.set(key, tile);
-        tile.lastUsed = nowMs();
-        logLine(`tile#${ti} 生成OK`);
-      } catch (e) {
-        logLine(`tile#${ti} 生成失敗: ${e?.message ?? e}`);
-      } finally {
-        tileInFlight.delete(key);
-        scheduleRender();
-      }
-    })();
-  }
-}
-
-function renderViewport(targetCanvas) {
-  if (!analyzer.inited) return;
-
-  const cfg = getConfig();
-  if (targetCanvas === UI.specCanvas) resizeCanvasToViewport();
-
-  const ctx = targetCanvas.getContext('2d', { alpha:false, willReadFrequently:false });
-  const cw = targetCanvas.width, ch = targetCanvas.height;
-
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0,0,cw, ch);
-
-  const plotH = Math.max(1, ch - PAD_T - PAD_B);
-  const range = getVisibleTimeRange(cfg);
-  if (targetCanvas === UI.specCanvas) updateLabels(range);
-
-  drawAxis(ctx, cfg, plotH, cw, ch);
-  drawTimeTopGrid(ctx, cfg, range.startSec, range.endSec, cw, ch);
-  drawBandHighlight(ctx, cfg, plotH, cw);
-
-  ensureTilesForRange(cfg, range);
-
-  const startIdx = Math.floor(range.startSec / cfg.tileSec);
-  const endIdx = Math.floor(range.endSec / cfg.tileSec);
-  const plotX0 = AXIS_W;
-
-  for (let ti = startIdx; ti <= endIdx; ti++){
-    const key = makeTileKey(ti, cfg);
-    const tile = tileCache.get(key);
-    if (!tile) continue;
-    tile.lastUsed = nowMs();
-
-    const tileStart = ti * cfg.tileSec;
-    const tileEnd = tileStart + cfg.tileSec;
-    const drawStart = Math.max(range.startSec, tileStart);
-    const drawEnd = Math.min(range.endSec, tileEnd);
-    if (drawEnd <= drawStart) continue;
-
-    const srcX0 = (drawStart - tileStart) * cfg.fps;
-    const srcX1 = (drawEnd - tileStart) * cfg.fps;
-    const srcW = Math.max(1, srcX1 - srcX0);
-
-    const dstX0 = plotX0 + (drawStart - range.startSec) * cfg.pxPerSec;
-    const dstW = (drawEnd - drawStart) * cfg.pxPerSec;
-
-    ctx.drawImage(tile.bitmap, srcX0, 0, srcW, tile.height, dstX0, PAD_T, dstW, plotH);
-  }
-
-  drawDetectionsOverlay(ctx, cfg, range.startSec, range.endSec, cw, ch);
-
-  const t = UI.fullAudio.currentTime || 0;
-  drawPlayhead(ctx, cfg, range.startSec, t, cw, ch);
-
-  if (analyzer.duration > 0 && targetCanvas === UI.specCanvas) {
-    const p = clamp(t / analyzer.duration, 0, 1);
-    UI.barFill.style.width = `${(p*100).toFixed(1)}%`;
-  }
-}
-
-/** ===================== Playback sync ===================== */
-function startPlayheadLoop() {
-  if (playingRaf) return;
-  const loop = () => {
-    playingRaf = requestAnimationFrame(loop);
+  if (UI.playBtn) UI.playBtn.addEventListener('click', async () => {
     if (!analyzer.inited) return;
-    if (UI.fullAudio.paused) return;
+    await playFrom(UI.fullAudio?.currentTime || 0);
+  });
+  if (UI.pauseBtn) UI.pauseBtn.addEventListener('click', () => { try { UI.fullAudio?.pause(); } catch {} });
+  if (UI.stopBtn) UI.stopBtn.addEventListener('click', () => { try { UI.fullAudio?.pause(); UI.fullAudio.currentTime = 0; } catch {} scheduleRender(); });
 
-    const cfg = getConfig();
-    const t = UI.fullAudio.currentTime || 0;
-    const x = t * cfg.pxPerSec;
-    const left = UI.viewport.scrollLeft;
-    const right = left + UI.viewport.clientWidth;
-    const margin = 140;
+  if (UI.exportViewBtn) UI.exportViewBtn.addEventListener('click', exportVisiblePNG);
+  if (UI.exportRangeBtn) UI.exportRangeBtn.addEventListener('click', exportRangePNG);
 
-    if (x < left + margin) UI.viewport.scrollLeft = Math.max(0, x - margin);
-    else if (x > right - margin) UI.viewport.scrollLeft = Math.max(0, x - (UI.viewport.clientWidth - margin));
+  // settings changes -> rerender
+  const onSettingChanged = () => { scheduleRender(); };
+  const listen = (el) => { if (!el) return; ['change','input'].forEach(evt => el.addEventListener(evt, onSettingChanged)); };
+  [UI.tileSec, UI.fps, UI.fftSize, UI.maxHz, UI.minDb, UI.maxDb, UI.cmap, UI.freqScale, UI.pxPerSec, UI.cacheTiles, UI.hlMinHz, UI.hlMaxHz].forEach(listen);
 
-    scheduleRender();
-  };
-  playingRaf = requestAnimationFrame(loop);
-}
-function stopPlayheadLoop() {
-  if (playingRaf) { cancelAnimationFrame(playingRaf); playingRaf = 0; }
-}
-
-async function playFrom(timeSec) {
-  if (!analyzer.inited) return;
-  UI.fullAudio.style.display = 'block';
-  UI.fullAudio.currentTime = clamp(timeSec, 0, analyzer.duration);
-  await sleep(40);
-  try { await UI.fullAudio.play(); }
-  catch (e) { logLine(`再生失敗: ${e?.message ?? e}`); return; }
-  startPlayheadLoop();
-  scheduleRender();
-}
-
-/** ===================== Export PNG (visible) ===================== */
-async function exportVisiblePNG() {
-  if (!analyzer.inited) return;
-  setState('PNG作成中');
-  UI.exportViewBtn.disabled = true;
-  if (UI.exportRangeBtn) UI.exportRangeBtn.disabled = true;
-  if (UI.exportRangeBtn) UI.exportRangeBtn.disabled = true;
-  if (UI.scanBtn) UI.scanBtn.disabled = true;
-  if (UI.scanStopBtn) UI.scanStopBtn.disabled = true;
-  if (UI.scanBarFill) UI.scanBarFill.style.width = '0%';
-  if (UI.scanStatus) UI.scanStatus.textContent = 'scan: -';
-  if (UI.detectList) UI.detectList.innerHTML='';
-  if (UI.detectCount) UI.detectCount.textContent='0件';
-  try {
-    const w = UI.specCanvas.width;
-    const h = UI.specCanvas.height;
-
-    const oc = (typeof OffscreenCanvas !== 'undefined')
-      ? new OffscreenCanvas(w, h)
-      : (() => { const c=document.createElement('canvas'); c.width=w; c.height=h; return c; })();
-
-    renderViewport(oc);
-    const blob = await (oc.convertToBlob ? oc.convertToBlob({ type:'image/png' }) : new Promise(r => oc.toBlob(r, 'image/png')));
-
-    const stamp = new Date().toISOString().replace(/[:.]/g,'-');
-    downloadBlob(blob, `spectrogram_view_${stamp}.png`);
-    setState('完了');
-  } catch (e) {
-    setState('エラー');
-    logLine(`PNG失敗: ${e?.message ?? e}`);
-  } finally {
-    UI.exportViewBtn.disabled = false;
-    UI.exportRangeBtn.disabled = false;
-    if (UI.scanBtn) UI.scanBtn.disabled = false;
-  }
-}
-
-
-async function exportRangePNG() {
-  if (!analyzer.inited) return;
-  setState('PNG作成中');
-  UI.exportRangeBtn.disabled = true;
-  try {
-    const cfg = getConfig();
-    const start = clamp(parseFloat(UI.exportStartSec.value) || 0, 0, analyzer.duration);
-    const end = clamp(parseFloat(UI.exportEndSec.value) || Math.min(analyzer.duration, start + 30), 0, analyzer.duration);
-    const a = Math.min(start, end);
-    const b = Math.max(start, end);
-    const span = Math.max(0.1, b - a);
-
-    // cap width to avoid huge memory
-    const desiredW = Math.floor(span * cfg.pxPerSec) + AXIS_W;
-    const maxW = 8000;
-    const scale = desiredW > maxW ? (maxW / desiredW) : 1.0;
-
-    const vp = UI.viewport.getBoundingClientRect();
-    const h = Math.max(240, Math.floor(vp.height));
-    const w = Math.max(600, Math.floor(desiredW * scale));
-
-    const oc = (typeof OffscreenCanvas !== 'undefined')
-      ? new OffscreenCanvas(w, h)
-      : (() => { const c=document.createElement('canvas'); c.width=w; c.height=h; return c; })();
-
-    // render range with adjusted pxPerSec
-    const cfg2 = { ...cfg, pxPerSec: cfg.pxPerSec * scale };
-    renderRangeToCanvas(oc, cfg2, a, b);
-
-    const blob = await (oc.convertToBlob ? oc.convertToBlob({ type:'image/png' }) : new Promise(r => oc.toBlob(r, 'image/png')));
-    const stamp = new Date().toISOString().replace(/[:.]/g,'-');
-    downloadBlob(blob, `spectrogram_${a.toFixed(0)}-${b.toFixed(0)}s_${stamp}.png`);
-    setState('完了');
-  } catch (e) {
-    setState('エラー');
-    logLine(`PNG(範囲)失敗: ${e?.message ?? e}`);
-  } finally {
-    UI.exportRangeBtn.disabled = false;
-  }
-}
-
-function renderRangeToCanvas(targetCanvas, cfg, startSec, endSec){
-  const ctx = targetCanvas.getContext('2d', { alpha:false, willReadFrequently:false });
-  const cw = targetCanvas.width, ch = targetCanvas.height;
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0,0,cw,ch);
-
-  const plotH = Math.max(1, ch - PAD_T - PAD_B);
-  const range = { startSec, endSec };
-
-  drawAxis(ctx, cfg, plotH, cw, ch);
-  drawTimeTopGrid(ctx, cfg, range.startSec, range.endSec, cw, ch);
-  drawBandHighlight(ctx, cfg, plotH, cw);
-
-  const startIdx = Math.floor(range.startSec / cfg.tileSec);
-  const endIdx = Math.floor(range.endSec / cfg.tileSec);
-  const plotX0 = AXIS_W;
-
-  for (let ti = startIdx; ti <= endIdx; ti++){
-    const keyFull = makeTileKey(ti, cfg);
-    let tile = tileCache.get(keyFull);
-    if (!tile) continue;
-
-    const tileStart = ti * cfg.tileSec;
-    const tileEnd = tileStart + cfg.tileSec;
-    const drawStart = Math.max(range.startSec, tileStart);
-    const drawEnd = Math.min(range.endSec, tileEnd);
-    if (drawEnd <= drawStart) continue;
-
-    const srcX0 = (drawStart - tileStart) * cfg.fps;
-    const srcX1 = (drawEnd - tileStart) * cfg.fps;
-    const srcW = Math.max(1, srcX1 - srcX0);
-
-    const dstX0 = plotX0 + (drawStart - range.startSec) * cfg.pxPerSec;
-    const dstW = (drawEnd - drawStart) * cfg.pxPerSec;
-
-    ctx.drawImage(tile.bitmap, srcX0, 0, srcW, tile.height, dstX0, PAD_T, dstW, plotH);
+  if (UI.viewport){
+    let scrollIdleTimer = 0;
+    UI.viewport.addEventListener('scroll', () => {
+      scheduleRender();
+      if (scrollIdleTimer) clearTimeout(scrollIdleTimer);
+      scrollIdleTimer = setTimeout(() => { scheduleRender(); }, SCROLL_IDLE_MS);
+    });
   }
 
-  drawDetectionsOverlay(ctx, cfg, range.startSec, range.endSec, cw, ch);
-
-  const t = UI.fullAudio.currentTime || 0;
-  drawPlayhead(ctx, cfg, range.startSec, t, cw, ch);
-}
-
-
-/** ===================== UI events ===================== */
-function clearAll() {
-  try { UI.fullAudio.pause(); } catch {}
-  stopPlayheadLoop();
-
-  if (abortCtrl) abortCtrl.abort();
-  abortCtrl = null;
-
-  for (const [,v] of tileCache) {
-    if (v?.bitmap?.close) { try { v.bitmap.close(); } catch {} }
+  if (UI.specCanvas){
+    UI.specCanvas.addEventListener('click', async (ev) => {
+      if (!analyzer.inited) return;
+      const cfg = getConfig();
+      const rect = UI.specCanvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left - AXIS_W;
+      const sec = (UI.viewport.scrollLeft / cfg.pxPerSec) + (x / cfg.pxPerSec);
+      await playFrom(sec);
+    });
   }
-  tileCache.clear();
-  tileInFlight = new Set();
 
-  try { analyzer.audio?.pause(); } catch {}
-  analyzer.analysisPlaying = false;
-
-  analyzer.file = null;
-  analyzer.inited = false;
-  analyzer.duration = 0;
-
-  UI.log.textContent = '';
-  UI.barFill.style.width = '0%';
-  UI.durLabel.textContent = '-';
-  UI.viewLabel.textContent = '-';
-  UI.tileLabel.textContent = '-';
-  setState('待機');
-
-  UI.fullAudio.style.display = 'none';
-
-  UI.playBtn.disabled = true;
-  UI.pauseBtn.disabled = true;
-  UI.stopBtn.disabled = true;
-  UI.exportViewBtn.disabled = true;
-  if (UI.exportRangeBtn) UI.exportRangeBtn.disabled = true;
-  if (UI.exportRangeBtn) UI.exportRangeBtn.disabled = true;
-  if (UI.scanBtn) UI.scanBtn.disabled = true;
-  if (UI.scanStopBtn) UI.scanStopBtn.disabled = true;
-  if (UI.scanBarFill) UI.scanBarFill.style.width = '0%';
-  if (UI.scanStatus) UI.scanStatus.textContent = 'scan: -';
-  if (UI.detectList) UI.detectList.innerHTML='';
-  if (UI.detectCount) UI.detectCount.textContent='0件';
-
-  UI.spacer.style.width = '0px';
-  UI.viewport.scrollLeft = 0;
-
-  resizeCanvasToViewport();
-  const ctx = UI.specCanvas.getContext('2d', { alpha:false });
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0,0,UI.specCanvas.width, UI.specCanvas.height);
-}
-
-UI.clearBtn.addEventListener('click', clearAll);
-UI.exportViewBtn.addEventListener('click', exportVisiblePNG);
-UI.exportRangeBtn.addEventListener('click', exportRangePNG);
-
-UI.prepareBtn.addEventListener('click', async () => {
-  const file = UI.fileInput.files?.[0];
-  if (!file) { alert('音声ファイルを選択してください'); return; }
-
-  UI.prepareBtn.disabled = true;
-  UI.playBtn.disabled = true;
-  UI.pauseBtn.disabled = true;
-  UI.stopBtn.disabled = true;
-  UI.exportViewBtn.disabled = true;
-  if (UI.exportRangeBtn) UI.exportRangeBtn.disabled = true;
-  if (UI.exportRangeBtn) UI.exportRangeBtn.disabled = true;
-  if (UI.scanBtn) UI.scanBtn.disabled = true;
-  if (UI.scanStopBtn) UI.scanStopBtn.disabled = true;
-  if (UI.scanBarFill) UI.scanBarFill.style.width = '0%';
-  if (UI.scanStatus) UI.scanStatus.textContent = 'scan: -';
-  if (UI.detectList) UI.detectList.innerHTML='';
-  if (UI.detectCount) UI.detectCount.textContent='0件';
-
-  abortCtrl = new AbortController();
-
-  try {
-    setState('準備中');
-    logLine(`選択: ${file.name} (${fmtBytes(file.size)})`);
-
-    const duration = await ensureFullAudioMetadata(file);
-    if (!Number.isFinite(duration) || duration <= 0) throw new Error('duration取得に失敗');
-
-    analyzer.duration = duration;
-    UI.durLabel.textContent = `${duration.toFixed(2)}s`;
-
-    await initAnalyzerForFile(file);
-    await ensureAnalysisPlaybackStarted(); // ★重要（ユーザー操作内）
-
-    const cfg = getConfig();
-    const totalW = Math.max(1, Math.floor(duration * cfg.pxPerSec));
-    UI.spacer.style.width = `${totalW}px`;
-    UI.spacer.style.height = '100%';
-    UI.viewport.scrollLeft = 0;
-
-    UI.playBtn.disabled = false;
-    UI.pauseBtn.disabled = false;
-    UI.stopBtn.disabled = false;
-    UI.exportViewBtn.disabled = false;
-    UI.exportRangeBtn.disabled = false;
-    if (UI.scanBtn) UI.scanBtn.disabled = false;
-
-    setState('準備完了');
-    resizeCanvasToViewport();
-    scheduleRender();
-    logLine('準備完了。スクロールするとタイル解析が進みます。');
-  } catch (e) {
-    setState('エラー');
-    logLine(`準備失敗: ${e?.message ?? e}`);
-  } finally {
-    UI.prepareBtn.disabled = false;
+  if (UI.fullAudio){
+    UI.fullAudio.addEventListener('timeupdate', scheduleRender);
+    UI.fullAudio.addEventListener('play', scheduleRender);
+    UI.fullAudio.addEventListener('pause', scheduleRender);
+    UI.fullAudio.addEventListener('seeked', scheduleRender);
   }
-});
 
-UI.playBtn.addEventListener('click', async () => {
-  if (!analyzer.inited) return;
-  await playFrom(UI.fullAudio.currentTime || 0);
-});
-UI.pauseBtn.addEventListener('click', () => {
-  try { UI.fullAudio.pause(); } catch {}
-  scheduleRender();
-});
-UI.stopBtn.addEventListener('click', () => {
-  try { UI.fullAudio.pause(); UI.fullAudio.currentTime = 0; } catch {}
-  stopPlayheadLoop();
-  UI.viewport.scrollLeft = 0;
-  scheduleRender();
-});
+  if (UI.presetSmallBird){
+    UI.presetSmallBird.addEventListener('click', () => { UI.scanMinHz.value = 3000; UI.scanMaxHz.value = 12000; });
+    UI.presetRaptor.addEventListener('click', () => { UI.scanMinHz.value = 1500; UI.scanMaxHz.value = 8000; });
+    UI.presetAll.addEventListener('click', () => { UI.scanMinHz.value = 0; UI.scanMaxHz.value = String(getConfig().maxHz); });
+  }
+  if (UI.scanBtn){
+    UI.scanBtn.addEventListener('click', runScanAsync);
+    UI.scanStopBtn.addEventListener('click', () => { if (scanAbort) scanAbort.abort(); });
+  }
 
-UI.viewport.addEventListener('scroll', () => scheduleRender());
-window.addEventListener('resize', () => scheduleRender());
-
-// click-to-seek
-UI.specCanvas.addEventListener('click', async (ev) => {
-  if (!analyzer.inited) return;
-  const cfg = getConfig();
-  const rect = UI.specCanvas.getBoundingClientRect();
-  const x = ev.clientX - rect.left;
-  if (x < AXIS_W) return;
-  const time = (UI.viewport.scrollLeft + x - AXIS_W) / cfg.pxPerSec;
-  await playFrom(time);
-});
-
-// settings change -> rerender + spacer update (zoom)
-function onSettingChanged() {
-  if (!analyzer.inited) { scheduleRender(); return; }
-  const cfg = getConfig();
-  const totalW = Math.max(1, Math.floor(analyzer.duration * cfg.pxPerSec));
-  UI.spacer.style.width = `${totalW}px`;
-  lruPrune(cfg.cacheTiles);
-  scheduleRender();
-}
-['change','input'].forEach(evt => {
-  UI.fftSize.addEventListener(evt, onSettingChanged);
-  UI.fps.addEventListener(evt, onSettingChanged);
-  UI.minHz.addEventListener(evt, onSettingChanged);
-  UI.maxHz.addEventListener(evt, onSettingChanged);
-  UI.minDb.addEventListener(evt, onSettingChanged);
-  UI.maxDb.addEventListener(evt, onSettingChanged);
-  UI.pxPerSec.addEventListener(evt, onSettingChanged);
-  UI.tileSec.addEventListener(evt, onSettingChanged);
-  UI.cacheTiles.addEventListener(evt, onSettingChanged);
-  UI.colorMap.addEventListener(evt, onSettingChanged);
-  UI.freqScale.addEventListener(evt, onSettingChanged);
-  UI.bandHighlight.addEventListener(evt, onSettingChanged);
-  UI.birdMinHz.addEventListener(evt, onSettingChanged);
-  UI.birdMaxHz.addEventListener(evt, onSettingChanged);
-});
-
-UI.fullAudio.addEventListener('play', () => startPlayheadLoop());
-UI.fullAudio.addEventListener('pause', () => scheduleRender());
-UI.fullAudio.addEventListener('timeupdate', () => scheduleRender());
-UI.fullAudio.addEventListener('ended', () => { stopPlayheadLoop(); scheduleRender(); });
-
-
-// === Scan / presets ===
-if (UI.presetSmallBird){
-  UI.presetSmallBird.addEventListener('click', () => { UI.scanMinHz.value = 3000; if (UI.scanMaxHz) UI.scanMaxHz.value = 12000; });
-  UI.presetRaptor.addEventListener('click', () => { UI.scanMinHz.value = 1500; if (UI.scanMaxHz) UI.scanMaxHz.value = 8000; });
-  UI.presetAll.addEventListener('click', () => { UI.scanMinHz.value = 0; if (UI.scanMaxHz) UI.scanMaxHz.value = getConfig().maxHz; });
-}
-if (UI.scanBtn){
-  UI.scanBtn.addEventListener('click', () => runScanAsync());
-  UI.scanStopBtn.addEventListener('click', () => { if (scanAbort) scanAbort.abort(); });
+  window.addEventListener('resize', () => { resizeCanvas(); scheduleRender(); });
 }
 
+wire();
 clearAll();
