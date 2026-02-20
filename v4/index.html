@@ -254,7 +254,7 @@
         <div class="card">
           <div class="card-title">帯域スキャン（巨大WAV向け / 5秒単位）</div>
           <div class="note">
-            ※ file.slice() でPCM領域を直接読み出す方式のため、現状は <b>WAV（PCM/Float）</b> のみ対応です。
+            ※ <b>MP3/WAV等に対応</b>（file.slice() → decodeAudioData → FFT解析）。MP3は圧縮の都合で分割境界でdecode失敗する場合がありますが、そのセグメントはスキップして継続します。
           </div>
 
           <div class="grid3">

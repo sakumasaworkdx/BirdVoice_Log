@@ -1078,8 +1078,10 @@ function decodePcmMono(buffer, header){
   return mono;
 }
 
-async function scanBandWav(file){
+async function scanBand(file){
+  // MP3/WAV等: 5秒相当の「推定バイト長」で slice → decodeAudioData → 既存FFT解析
   const SEG_SEC = 5;
+  const OVERLAP_SEC = 0.25; // MP3の切れ目対策（少し重ねる）
 
   setState('スキャン中');
   UI.scanBtn.disabled = true;
@@ -1090,10 +1092,17 @@ async function scanBandWav(file){
   scanAbortCtrl = new AbortController();
   const sig = scanAbortCtrl.signal;
 
-  const header = await readWavHeader(file);
-  const bytesPerSec = header.sampleRate * header.blockAlign;
-  const segBytes = Math.floor(bytesPerSec * SEG_SEC);
-  const totalSeg = Math.ceil(header.dataSize / segBytes);
+  // durationは prepare 済み（ensureFullAudioMetadata）を前提
+  const duration = analyzer.duration || await ensureFullAudioMetadata(file);
+  if (!Number.isFinite(duration) || duration <= 0) throw new Error('duration取得に失敗');
+
+  // 5秒セグメント数
+  const totalSeg = Math.ceil(duration / SEG_SEC);
+
+  // 5秒を「バイト」に概算（圧縮形式のため厳密ではない）
+  const bytesPerSecEst = file.size / duration;
+  const segBytes = Math.max(1024 * 256, Math.floor(bytesPerSecEst * SEG_SEC)); // 最低256KB
+  const overlapBytes = Math.floor(bytesPerSecEst * OVERLAP_SEC);
 
   // FFT config (fixed, fast)
   const FFT_N = 2048;
@@ -1101,18 +1110,22 @@ async function scanBandWav(file){
   const re = new Float32Array(FFT_N);
   const im = new Float32Array(FFT_N);
 
-  const minHz = clamp(parseInt(UI.scanMinHz.value,10)||0, 0, header.sampleRate/2);
-  const maxHz = clamp(parseInt(UI.scanMaxHz.value,10)||0, 0, header.sampleRate/2);
+  const minHz = clamp(parseInt(UI.scanMinHz.value,10)||0, 0, 24000);
+  const maxHz = clamp(parseInt(UI.scanMaxHz.value,10)||0, 0, 24000);
   const thrDb = parseInt(UI.scanThreshold.value,10) || -60;
   const lo = Math.min(minHz, maxHz);
   const hi = Math.max(minHz, maxHz);
 
-  const binHz = header.sampleRate / FFT_N;
-  const minBin = clamp(Math.floor(lo / binHz), 0, FFT_N/2);
-  const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
+  // AudioContext
+  if (!analyzer.audioCtx) analyzer.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const audioCtx = analyzer.audioCtx;
+  if (audioCtx.state === 'suspended') {
+    try { await audioCtx.resume(); } catch {}
+  }
 
-  logLine(`スキャン開始: WAV ${header.sampleRate}Hz ch=${header.numChannels} bits=${header.bitsPerSample} / SEG=5s / FFT=${FFT_N}`);
+  logLine(`スキャン開始: ${file.name} (${fmtBytes(file.size)}) / duration≈${duration.toFixed(2)}s / SEG=5s / FFT=${FFT_N}`);
   logLine(`帯域: ${lo}..${hi} Hz / しきい値: ${thrDb} dB`);
+  logLine(`slice概算: segBytes≈${fmtBytes(segBytes)} / overlap≈${fmtBytes(overlapBytes)}`);
 
   let lastDetectedBucket = -9999; // 5s bucket index
   let detects = 0;
@@ -1120,56 +1133,102 @@ async function scanBandWav(file){
   for (let seg=0; seg<totalSeg; seg++){
     if (sig.aborted) throw new Error('スキャン中断');
 
-    const startByte = seg * segBytes;
-    const endByte = Math.min(header.dataSize, startByte + segBytes);
-    const sliceStart = header.dataOffset + startByte;
-    const sliceEnd = header.dataOffset + endByte;
+    // 目標時刻（表示用。decode後のaudioBuf.durationとはズレる可能性あり）
+    const segStartSec = seg * SEG_SEC;
 
-    const ab = await file.slice(sliceStart, sliceEnd).arrayBuffer();
-    const mono = decodePcmMono(ab, header);
+    // バイト範囲（概算）
+    const startByte = Math.max(0, Math.floor(segStartSec * bytesPerSecEst) - overlapBytes);
+    const endByte = Math.min(file.size, startByte + segBytes + overlapBytes);
 
-    // STFT over this segment
-    const hop = FFT_N >> 1;
-    let acc = 0;
-    let frames = 0;
+    const blob = file.slice(startByte, endByte);
+    let arrayBuf = null;
+    try {
+      arrayBuf = await blob.arrayBuffer();
 
-    for (let i=0; i + FFT_N <= mono.length; i += hop){
-      // window + copy
-      for (let n=0;n<FFT_N;n++){
-        re[n] = mono[i+n] * hannWindow(n, FFT_N);
-        im[n] = 0;
+      // ★ MP3対応: decodeAudioData を通す
+      const audioBuf = await audioCtx.decodeAudioData(arrayBuf);
+
+      const sr = audioBuf.sampleRate;
+      const mono = audioBuf.getChannelData(0); // 既存FFT解析はFloat32モノラル想定
+
+      // セグメントごとにbinを計算（srが変わる可能性があるため）
+      const binHz = sr / FFT_N;
+      const minBin = clamp(Math.floor(lo / binHz), 0, FFT_N/2);
+      const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
+
+      // STFT over this decoded chunk (5s前後)
+      const hop = FFT_N >> 1;
+      let acc = 0;
+      let frames = 0;
+
+      for (let i=0; i + FFT_N <= mono.length; i += hop){
+        for (let n=0;n<FFT_N;n++){
+          re[n] = mono[i+n] * hannWindow(n, FFT_N);
+          im[n] = 0;
+        }
+        fftInPlace(re, im, plan);
+
+        let bandPow = 0;
+        for (let b=minBin; b<=maxBin; b++){
+          const rr = re[b], ii = im[b];
+          bandPow += rr*rr + ii*ii;
+        }
+        acc += bandPow;
+        frames++;
+        if (sig.aborted) break;
       }
-      fftInPlace(re, im, plan);
 
-      let bandPow = 0;
-      for (let b=minBin; b<=maxBin; b++){
-        const rr = re[b], ii = im[b];
-        bandPow += rr*rr + ii*ii;
+      const meanPow = frames ? (acc / frames) : 0;
+      const db = 10 * Math.log10(meanPow + 1e-12);
+
+      // 進捗
+      const pct = ((seg+1)/totalSeg)*100;
+      setScanProgress(pct);
+
+      // 検出（5秒単位でまとめ）
+      if (db >= thrDb){
+        const bucket = seg; // 5秒グリッド
+        if (bucket !== lastDetectedBucket){
+          lastDetectedBucket = bucket;
+          addDetectButton(bucket * SEG_SEC);
+          detects++;
+        }
       }
-      acc += bandPow;
-      frames++;
-      if (sig.aborted) break;
+
+      // ★ メモリ解放（GCが効きやすいように）
+      // audioBufはスコープ終了で解放されるが、参照を切っておく
+      // eslint-disable-next-line no-unused-vars
+      // (monoはaudioBuf内部参照なのでaudioBuf解放を促すためaudioBuf参照を切る)
+      // ここでは明示的にnull代入
+      // NOTE: getChannelDataで得たmonoはaudioBufが生きていると保持される
+      //       なので audioBuf への参照を切るのが主目的
+      //       arrayBufも大きいので切る
+      // eslint-disable-next-line no-unused-vars
+      // (JS engineにより最適化されるが、意図を明確に)
+      // @ts-ignore
+      // eslint-disable-next-line no-param-reassign
+      arrayBuf = null;
+      // @ts-ignore
+      // eslint-disable-next-line no-unused-vars
+      // (audioBuf is const; cannot null. keep in block scope only)
+      // monoは参照だけなので切る
+      // @ts-ignore
+      // eslint-disable-next-line no-unused-vars
+      // (mono is const; cannot null. keep in block scope only)
+
+    } catch (e) {
+      // ★ エラーハンドリング: デコード失敗でも継続
+      console.warn('デコード失敗、スキップします', e);
+      logLine(`seg#${seg} decode失敗（skip）: ${e?.message ?? e}`);
+      const pct = ((seg+1)/totalSeg)*100;
+      setScanProgress(pct);
+    } finally {
+      // 追加の解放
+      blob && void 0;
+      arrayBuf = null;
     }
 
-    // Convert to dB (relative)
-    const meanPow = frames ? (acc / frames) : 0;
-    const db = 10 * Math.log10(meanPow + 1e-12);
-
-    const pct = ((seg+1)/totalSeg)*100;
-    setScanProgress(pct);
-
-    // detect, bucketed per 5s (seg itself)
-    if (db >= thrDb){
-      const bucket = seg; // already 5s
-      if (bucket !== lastDetectedBucket){
-        lastDetectedBucket = bucket;
-        const sec = bucket * SEG_SEC;
-        addDetectButton(sec);
-        detects++;
-      }
-    }
-
-    // Yield to UI every segment
+    // UIに制御を返す
     await sleep(0);
   }
 
@@ -1177,12 +1236,13 @@ async function scanBandWav(file){
   setState('準備完了');
 }
 
+
 UI.scanBtn.addEventListener('click', async () => {
   const file = UI.fileInput.files?.[0];
   if (!file) { alert('音声ファイルを選択してください'); return; }
 
   try {
-    await scanBandWav(file);
+    await scanBand(file);
   } catch (e) {
     const msg = e?.message ?? String(e);
     logLine(`スキャン停止: ${msg}`);
