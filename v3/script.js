@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * v2.5.1
+ * v2.5.2
  * - 読み込み/準備が反応しない原因のほとんどは「index.html と script.js の不一致」です。
  *   このスクリプトは、要素が無い場合でも落ちないようにガードしてあります。
  */
@@ -93,6 +93,19 @@ function setState(s){
 function nowMs(){ return performance.now(); }
 function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+async function seekAndWait(audio, t, timeoutMs=700){
+  return new Promise((resolve) => {
+    let done = false;
+    const onSeeked = () => { if (done) return; done = true; cleanup(); resolve(true); };
+    const onErr = () => { if (done) return; done = true; cleanup(); resolve(false); };
+    const timer = setTimeout(() => { if (done) return; done = true; cleanup(); resolve(false); }, timeoutMs);
+    function cleanup(){ clearTimeout(timer); audio.removeEventListener('seeked', onSeeked); audio.removeEventListener('error', onErr); }
+    audio.addEventListener('seeked', onSeeked, { once:true });
+    audio.addEventListener('error', onErr, { once:true });
+    try{ audio.currentTime = t; } catch { cleanup(); resolve(false); }
+  });
+}
 
 function secToHMS(sec){
   sec = Math.max(0, sec);
@@ -260,17 +273,18 @@ function spectrumToFeatureBands(tmpDb, cfg, edges){
   return out;
 }
 function featureBandsToMeanDb(featureBands, edges, minHz, maxHz){
-  let sumP = 0, n = 0;
+  let sumP = 0;
+  let n = 0;
   for (let bi=0; bi<FEATURE_BANDS; bi++){
     const loHz = edges[bi], hiHz = edges[bi+1];
     if (hiHz <= minHz || loHz >= maxHz) continue;
     const db = (featureBands[bi] - 12000) / 100;
     const p = Math.pow(10, db / 10);
-    sumP += p; n++;
+    sumP += p;
+    n++;
   }
   if (n <= 0) return -120;
-  const meanP = sumP / n;
-  return 10 * Math.log10(Math.max(1e-12, meanP));
+  return 10 * Math.log10(Math.max(1e-12, sumP));
 }
 function featureBandsPeakDb(featureBands, edges, minHz, maxHz){
   let best = -120;
@@ -363,6 +377,7 @@ async function ensureAudioGraph(){
   analyzer.audio.preload = 'auto';
   analyzer.audio.crossOrigin = 'anonymous';
   analyzer.audio.loop = true; // analysis seeks are easier
+  analyzer.audio.playsInline = true;
   analyzer.audio.muted = true;
   analyzer.audio.volume = 0;
 
@@ -412,10 +427,11 @@ async function prepare(){
   // start muted analysis playback once (gesture already happened)
   try{
     if (analyzer.audioCtx.state === 'suspended') await analyzer.audioCtx.resume();
+    analyzer.audio.muted = true;
+    analyzer.audio.volume = 0;
     await analyzer.audio.play();
     analyzer.analysisPlaying = true;
   } catch (e){
-    // some browsers still block; will try later at playFrom
     analyzer.analysisPlaying = false;
     logLine('分析用の再生開始に失敗（後で再試行します）');
   }
@@ -490,9 +506,10 @@ async function generateTileBitmap(tileIndex, cfg, signal){
   const img = ctx.createImageData(width, height);
   const data = img.data;
 
-  // seek
-  analyzer.audio.currentTime = clamp(tileStart, 0, Math.max(0, analyzer.duration - 0.001));
-  await sleep(80);
+  // seek (wait for seeked; ensure analysis audio is actually playing)
+  const startT = clamp(tileStart, 0, Math.max(0, analyzer.duration - 0.001));
+  await seekAndWait(analyzer.audio, startT);
+  if (analyzer.audio.paused){ try{ await analyzer.audio.play(); analyzer.analysisPlaying = true; } catch {} }
 
   // fill columns
   for (let x=0; x<width; x++){
@@ -500,8 +517,8 @@ async function generateTileBitmap(tileIndex, cfg, signal){
     const t = tileStart + (x / cfg.fps);
     if (t >= analyzer.duration) break;
 
-    analyzer.audio.currentTime = t;
-    await sleep(8);
+    await seekAndWait(analyzer.audio, clamp(t, 0, Math.max(0, analyzer.duration-0.001)), 450);
+    if (analyzer.audio.paused){ try{ await analyzer.audio.play(); analyzer.analysisPlaying = true; } catch {} }
 
     analyzer.analyser.getFloatFrequencyData(tmp);
     featCols[x] = spectrumToFeatureBands(tmp, cfg, featEdges);
@@ -919,14 +936,14 @@ function bandMeanDbFromSpectrum(tmpDb, cfg, minHz, maxHz){
   const hi = clamp(Math.ceil(maxHz / binHz), 0, bins-1);
   if (hi <= lo) return -120;
 
-  let sumP = 0, n = 0;
+  let sumP = 0;
   for (let i=lo;i<=hi;i++){
     const db = tmpDb[i];
     const p = Math.pow(10, (Math.max(-120, db) / 10));
-    sumP += p; n++;
+    sumP += p;
   }
-  const meanP = sumP / Math.max(1,n);
-  return 10 * Math.log10(Math.max(1e-12, meanP));
+  // SUM energy in band (not average): easier thresholding for detection
+  return 10 * Math.log10(Math.max(1e-12, sumP));
 }
 
 async function runScanAsync(){
@@ -951,7 +968,7 @@ async function runScanAsync(){
   scanHits = [];
   updateDetectList();
   if (UI.scanBarFill) UI.scanBarFill.style.width = '0%';
-  if (UI.scanStatus) UI.scanStatus.textContent = `scan: 0/${secToHMS(analyzer.duration)} step=${stepSec}s band=${minHz}-${maxHz}Hz thr=${thr}dB`;
+  if (UI.scanStatus) UI.scanStatus.textContent = `scan: 0/${secToHMS(analyzer.duration)} step=${stepSec}s band=${minHz}-${maxHz}Hz thr=${thr}dB(energy)`;
 
   scanAbort = new AbortController();
   setScanUI(true);
@@ -988,8 +1005,8 @@ async function runScanAsync(){
       }
 
       if (meanDb === null){
-        analyzer.audio.currentTime = t;
-        await sleep(80);
+        await seekAndWait(analyzer.audio, clamp(t, 0, Math.max(0, analyzer.duration-0.001)), 650);
+        if (analyzer.audio.paused){ try{ await analyzer.audio.play(); analyzer.analysisPlaying = true; } catch {} }
         analyzer.analyser.getFloatFrequencyData(tmp);
         meanDb = bandMeanDbFromSpectrum(tmp, cfg, minHz, maxHz);
 
