@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * v2.5.5
+ * v2.5.6
  * - 読み込み/準備が反応しない原因のほとんどは「index.html と script.js の不一致」です。
  *   このスクリプトは、要素が無い場合でも落ちないようにガードしてあります。
  */
@@ -179,7 +179,7 @@ function clearAll(){
   try { analyzer.srcNode?.disconnect(); } catch {}
   try { analyzer.analyser?.disconnect(); } catch {}
   try { analyzer.gain0?.disconnect(); } catch {}
-  try { analyzer.audioCtx?.close(); } catch {}
+  try { if (analyzer.audioCtx && analyzer.audioCtx.state !== 'closed') analyzer.audioCtx.close(); } catch {}
 
   analyzer.inited = false;
   analyzer.duration = 0;
@@ -387,7 +387,7 @@ async function ensureAudioGraph(){
 
   analyzer.srcNode = analyzer.audioCtx.createMediaElementSource(analyzer.audio);
   analyzer.gain0 = analyzer.audioCtx.createGain();
-  analyzer.gain0.gain.value = 0;
+  analyzer.gain0.gain.value = 0.00001; // near silent, but keeps processing
   analyzer.srcNode.connect(analyzer.analyser);
   analyzer.analyser.connect(analyzer.gain0);
   analyzer.gain0.connect(analyzer.audioCtx.destination);
@@ -434,8 +434,9 @@ async function prepare(){
   // start muted analysis playback once (gesture already happened)
   try{
     if (analyzer.audioCtx.state === 'suspended') await analyzer.audioCtx.resume();
-    analyzer.audio.muted = true;
-    analyzer.audio.volume = 0;
+    // Keep element unmuted; some browsers stop processing muted+0 volume
+    analyzer.audio.muted = false;
+    analyzer.audio.volume = 1;
     await analyzer.audio.play();
     analyzer.analysisPlaying = true;
   } catch (e){
@@ -502,6 +503,7 @@ async function generateTileBitmap(tileIndex, cfg, signal){
 
   const bins = analyzer.analyser.frequencyBinCount;
   const tmp = new Float32Array(bins);
+  const tmpB = new Uint8Array(bins);
   const featEdges = buildFeatureBands(cfg);
   const featCols = new Array(width);
 
@@ -904,16 +906,20 @@ async function exportRangePNG(){
 
 function spectrumStats(tmp){
   let max = -Infinity, min = Infinity;
-  let finite = 0;
+  let finite = 0, negInf = 0, nan = 0;
   for (let i=0;i<tmp.length;i++){
     const v = tmp[i];
     if (Number.isFinite(v)){
       finite++;
       if (v>max) max=v;
       if (v<min) min=v;
+    } else if (v === -Infinity){
+      negInf++;
+    } else {
+      nan++;
     }
   }
-  return { max, min, finite, n: tmp.length };
+  return { max, min, finite, negInf, nan, n: tmp.length };
 }
 
 async function runDiagnostics(){
@@ -933,6 +939,7 @@ async function runDiagnostics(){
 
   const bins = analyzer.analyser.frequencyBinCount;
   const tmp = new Float32Array(bins);
+  const tmpB = new Uint8Array(bins);
 
   const range = getViewportRange(cfg);
   const t0 = clamp(range.startSec, 0, Math.max(0, analyzer.duration-0.001));
@@ -944,15 +951,19 @@ async function runDiagnostics(){
 
   await seekAndWait(analyzer.audio, t0, 800);
   analyzer.analyser.getFloatFrequencyData(tmp);
+  analyzer.analyser.getByteFrequencyData(tmpB);
   const s0 = spectrumStats(tmp);
+  let maxB0 = 0; for (let i=0;i<tmpB.length;i++) if (tmpB[i]>maxB0) maxB0=tmpB[i];
 
   await seekAndWait(analyzer.audio, t1, 800);
   analyzer.analyser.getFloatFrequencyData(tmp);
+  analyzer.analyser.getByteFrequencyData(tmpB);
   const s1 = spectrumStats(tmp);
+  let maxB1 = 0; for (let i=0;i<tmpB.length;i++) if (tmpB[i]>maxB1) maxB1=tmpB[i];
 
   logLine(`diag: analysisPaused=${analyzer.audio.paused} ctx=${analyzer.audioCtx.state} dur=${secToHMS(analyzer.duration)}`);
-  logLine(`diag@${secToHMS(t0)}: finite=${s0.finite}/${s0.n} max=${s0.max.toFixed(1)} min=${s0.min.toFixed(1)}`);
-  logLine(`diag@${secToHMS(t1)}: finite=${s1.finite}/${s1.n} max=${s1.max.toFixed(1)} min=${s1.min.toFixed(1)}`);
+  logLine(`diag@${secToHMS(t0)}: finite=${s0.finite}/${s0.n} -Inf=${s0.negInf} NaN=${s0.nan} max=${Number.isFinite(s0.max)?s0.max.toFixed(1):String(s0.max)} min=${Number.isFinite(s0.min)?s0.min.toFixed(1):String(s0.min)} byteMax=${maxB0}`);
+  logLine(`diag@${secToHMS(t1)}: finite=${s1.finite}/${s1.n} -Inf=${s1.negInf} NaN=${s1.nan} max=${Number.isFinite(s1.max)?s1.max.toFixed(1):String(s1.max)} min=${Number.isFinite(s1.min)?s1.min.toFixed(1):String(s1.min)} byteMax=${maxB1}`);
   logLine('diag: max がずっと minDb 付近なら「解析音が入ってない（無音/デコード失敗/シーク未反映）」です');
 }
 
@@ -1027,6 +1038,7 @@ async function runScanAsync(){
 
   const bins = analyzer.analyser.frequencyBinCount;
   const tmp = new Float32Array(bins);
+  const tmpB = new Uint8Array(bins);
 
   scanHits = [];
   updateDetectList();
@@ -1198,5 +1210,5 @@ function wire(){
 
 wire();
 window.__diagClick = () => { logLine('diag: clicked'); try{ runDiagnostics(); } catch(e){ logLine('diag: exception ' + (e?.message ?? e)); } };
-logLine('[boot] v2.5.5 loaded');
+logLine('[boot] v2.5.6 loaded');
 clearAll();
