@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * v2.5.3
+ * v2.5.4
  * - 読み込み/準備が反応しない原因のほとんどは「index.html と script.js の不一致」です。
  *   このスクリプトは、要素が無い場合でも落ちないようにガードしてあります。
  */
@@ -917,8 +917,12 @@ function spectrumStats(tmp){
 }
 
 async function runDiagnostics(){
+  if (!UI.log){
+    UI.log = document.getElementById('log');
+  }
   if (!analyzer.inited){
     logLine('diag: 未準備（先に 読み込み/準備）');
+    try{ alert('未準備です。先に「読み込み/準備」を押してください。'); } catch {}
     return;
   }
   const cfg = getConfig();
@@ -1193,4 +1197,5 @@ function wire(){
 }
 
 wire();
+logLine('[boot] v2.5.4 loaded');
 clearAll();
