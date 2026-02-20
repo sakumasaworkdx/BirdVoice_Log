@@ -261,17 +261,17 @@
             <div class="field">
               <label>最小周波数 (Hz)</label>
               <input id="scanMinHz" type="range" min="0" max="24000" step="10" value="2000"/>
-              <div class="hint mono"><input id="scanMinHzVal" type="number" min="0" max="24000" step="10" value="\1" /> Hz</div>
+              <div class="hint mono"><input id="scanMinHzVal" type="number" min="0" max="24000" step="10" value="2000" /> Hz</div>
             </div>
             <div class="field">
               <label>最大周波数 (Hz)</label>
               <input id="scanMaxHz" type="range" min="0" max="24000" step="10" value="8000"/>
-              <div class="hint mono"><input id="scanMaxHzVal" type="number" min="0" max="24000" step="10" value="\1" /> Hz</div>
+              <div class="hint mono"><input id="scanMaxHzVal" type="number" min="0" max="24000" step="10" value="8000" /> Hz</div>
             </div>
             <div class="field">
               <label>感度（しきい値 dB）</label>
               <input id="scanThreshold" type="range" min="-120" max="0" step="1" value="-45"/>
-              <div class="hint mono"><input id="scanThresholdVal" type="number" min="-120" max="0" step="1" value="\1" /> dB</div>
+              <div class="hint mono"><input id="scanThresholdVal" type="number" min="-120" max="0" step="1" value="-45" /> dB</div>
             </div>
           </div>
 
@@ -287,6 +287,9 @@
           <div class="row">
             <button id="scanBtn" class="primary" disabled>全時間スキャン開始</button>
             <button id="scanAbortBtn" class="ghost" disabled>中断</button>
+            <button id="presetNight2" class="ghost" type="button">夜間汎用</button>
+            <button id="presetOwl2" class="ghost" type="button">フクロウ</button>
+            <button id="presetTora2" class="ghost" type="button">トラツグミ</button>
             <div class="flex-grow"></div>
             <span class="pill mono">進捗: <strong id="scanPct">0%</strong></span>
           </div>

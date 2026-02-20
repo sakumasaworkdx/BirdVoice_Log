@@ -40,6 +40,9 @@ const UI = {
   presetNight: document.getElementById('presetNight'),
   presetOwl: document.getElementById('presetOwl'),
   presetTora: document.getElementById('presetTora'),
+  presetNight2: document.getElementById('presetNight2'),
+  presetOwl2: document.getElementById('presetOwl2'),
+  presetTora2: document.getElementById('presetTora2'),
   scanBtn: document.getElementById('scanBtn'),
   scanAbortBtn: document.getElementById('scanAbortBtn'),
   scanPct: document.getElementById('scanPct'),
@@ -1201,7 +1204,7 @@ async function scanBandWav(file){
       const mono = pcmBufferToMonoFloat32(buf, header); // Float32 mono
 
       const hop = FFT_N >> 1;
-      let peakEnergy = 0;
+      let detectedInSeg = false;
 
       for (let i=0; i + FFT_N <= mono.length; i += hop){
         for (let n=0;n<FFT_N;n++){
@@ -1210,21 +1213,24 @@ async function scanBandWav(file){
         }
         fftInPlace(re, im, plan);
 
-        let bandEnergy = 0;
+        // 1フレーム内: 指定帯域(minBin..maxBin)の"最大"パワー(ピーク)で判定
+        let frameMaxPow = 0;
         for (let b=minBin; b<=maxBin; b++){
           const rr = re[b], ii = im[b];
-          bandEnergy += rr*rr + ii*ii;
+          const p = rr*rr + ii*ii;
+          if (p > frameMaxPow) frameMaxPow = p;
         }
-        if (bandEnergy > peakEnergy) peakEnergy = bandEnergy;
-
+        const frameDb = 10 * Math.log10(frameMaxPow + 1e-12);
+        if (frameDb >= thr){
+          detectedInSeg = true;
+          break;
+        }
         if (sig.aborted) break;
       }
 
-      const db = 10 * Math.log10(peakEnergy + 1e-12);
-
       setScanProgress(((seg+1)/totalSeg)*100);
 
-      if (db >= thr){
+      if (detectedInSeg){
         const bucket = seg; // 5秒単位
         if (bucket !== lastBucket){
           lastBucket = bucket;
@@ -1316,7 +1322,7 @@ async function scanBandMp3(file){
       const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
 
       const hop = FFT_N >> 1;
-      let peakEnergy = 0;
+      let detectedInSeg = false;
 
       for (let i=0; i + FFT_N <= mono.length; i += hop){
         for (let n=0;n<FFT_N;n++){
@@ -1325,21 +1331,24 @@ async function scanBandMp3(file){
         }
         fftInPlace(re, im, plan);
 
-        let bandEnergy = 0;
+        // 1フレーム内: 指定帯域(minBin..maxBin)の"最大"パワー(ピーク)で判定
+        let frameMaxPow = 0;
         for (let b=minBin; b<=maxBin; b++){
           const rr = re[b], ii = im[b];
-          bandEnergy += rr*rr + ii*ii;
+          const p = rr*rr + ii*ii;
+          if (p > frameMaxPow) frameMaxPow = p;
         }
-        if (bandEnergy > peakEnergy) peakEnergy = bandEnergy;
-
+        const frameDb = 10 * Math.log10(frameMaxPow + 1e-12);
+        if (frameDb >= thr){
+          detectedInSeg = true;
+          break;
+        }
         if (sig.aborted) break;
       }
 
-      const db = 10 * Math.log10(peakEnergy + 1e-12);
-
       setScanProgress(((seg+1)/totalSeg)*100);
 
-      if (db >= thr){
+      if (detectedInSeg){
         const bucket = seg; // 5秒単位
         if (bucket !== lastBucket){
           lastBucket = bucket;
