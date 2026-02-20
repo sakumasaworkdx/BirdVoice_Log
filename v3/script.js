@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * v2.5.7
+ * v2.6.1
  * - 読み込み/準備が反応しない原因のほとんどは「index.html と script.js の不一致」です。
  *   このスクリプトは、要素が無い場合でも落ちないようにガードしてあります。
  */
@@ -42,6 +42,8 @@ const UI = {
   maxHz: document.getElementById('maxHz'),
   minDb: document.getElementById('minDb'),
   maxDb: document.getElementById('maxDb'),
+  autoContrast: document.getElementById('autoContrast'),
+  autoDR: document.getElementById('autoDR'),
   cmap: document.getElementById('cmap'),
   freqScale: document.getElementById('freqScale'),
   pxPerSec: document.getElementById('pxPerSec'),
@@ -134,6 +136,8 @@ function getConfig(){
   const maxHz = clamp(parseFloat(UI.maxHz?.value) || 12000, 1000, 24000);
   const minDb = clamp(parseFloat(UI.minDb?.value) || -100, -120, -10);
   const maxDb = clamp(parseFloat(UI.maxDb?.value) || -20, -80, 0);
+  const autoContrast = !!UI.autoContrast?.checked;
+  const autoDR = clamp(parseFloat(UI.autoDR?.value) || 80, 20, 120);
   const cmap = UI.cmap?.value || 'Grayscale';
   const freqScale = UI.freqScale?.value || 'log';
   const pxPerSec = clamp(parseFloat(UI.pxPerSec?.value) || 120, 30, 400);
@@ -141,7 +145,7 @@ function getConfig(){
   const hlMinHz = clamp(parseFloat(UI.hlMinHz?.value) || 2500, 0, 24000);
   const hlMaxHz = clamp(parseFloat(UI.hlMaxHz?.value) || 9000, 0, 24000);
   return {
-    tileSec, fps, fftSize, maxHz, minDb, maxDb, cmap, freqScale, pxPerSec, cacheTiles,
+    tileSec, fps, fftSize, maxHz, minDb, maxDb, autoContrast, autoDR, cmap, freqScale, pxPerSec, cacheTiles,
     hlMinHz: Math.min(hlMinHz, hlMaxHz),
     hlMaxHz: Math.max(hlMinHz, hlMaxHz),
     minHz: 50,
@@ -530,6 +534,16 @@ async function generateTileBitmap(tileIndex, cfg, signal){
     if (analyzer.audio.paused){ try{ await analyzer.audio.play(); analyzer.analysisPlaying = true; } catch {} }
 
     analyzer.analyser.getFloatFrequencyData(tmp);
+    // auto contrast: find peak in display band (0..cfg.maxHz)
+    let colMax = -Infinity;
+    if (cfg.autoContrast){
+      const binHz = analyzer.audioCtx.sampleRate / cfg.fftSize;
+      const maxBi = clamp(Math.round(cfg.maxHz / binHz), 0, bins-1);
+      for (let bi=0; bi<=maxBi; bi++){
+        const v = tmp[bi];
+        if (Number.isFinite(v) && v > colMax) colMax = v;
+      }
+    }
     featCols[x] = spectrumToFeatureBands(tmp, cfg, featEdges);
 
     for (let y=0; y<height; y++){
@@ -538,8 +552,14 @@ async function generateTileBitmap(tileIndex, cfg, signal){
       const bi = clamp(Math.round(hz / binHz), 0, bins-1);
       let db = tmp[bi];
       if (!Number.isFinite(db)) db = cfg.minDb; // -Infinity 対策
-      const v = (db - cfg.minDb) / (cfg.maxDb - cfg.minDb);
-      const tcol = clamp01(v);
+      let tcol;
+      if (cfg.autoContrast && Number.isFinite(colMax)){
+        const dynMax = colMax - 5; // keep headroom
+        const dynMin = dynMax - cfg.autoDR;
+        tcol = clamp01((db - dynMin) / (dynMax - dynMin));
+      } else {
+        tcol = clamp01((db - cfg.minDb) / (cfg.maxDb - cfg.minDb));
+      }
       const rgb = mapColor(cfg.cmap, tcol);
       const off = (y*width + x) * 4;
       data[off+0] = rgb[0];
@@ -954,17 +974,29 @@ async function runDiagnostics(){
   analyzer.analyser.getByteFrequencyData(tmpB);
   const s0 = spectrumStats(tmp);
   let maxB0 = 0; for (let i=0;i<tmpB.length;i++) if (tmpB[i]>maxB0) maxB0=tmpB[i];
+  const binHz0 = analyzer.audioCtx.sampleRate / cfg.fftSize;
+  const loBird0 = clamp(Math.round(cfg.hlMinHz / binHz0), 0, bins-1);
+  const hiBird0 = clamp(Math.round(cfg.hlMaxHz / binHz0), 0, bins-1);
+  let birdBandMax0 = -Infinity;
+  for (let i=loBird0;i<=hiBird0;i++){ const v=tmp[i]; if (Number.isFinite(v) && v>birdBandMax0) birdBandMax0=v; }
 
   await seekAndWait(analyzer.audio, t1, 800);
   analyzer.analyser.getFloatFrequencyData(tmp);
   analyzer.analyser.getByteFrequencyData(tmpB);
   const s1 = spectrumStats(tmp);
   let maxB1 = 0; for (let i=0;i<tmpB.length;i++) if (tmpB[i]>maxB1) maxB1=tmpB[i];
+  const binHz1 = analyzer.audioCtx.sampleRate / cfg.fftSize;
+  const loBird1 = clamp(Math.round(cfg.hlMinHz / binHz1), 0, bins-1);
+  const hiBird1 = clamp(Math.round(cfg.hlMaxHz / binHz1), 0, bins-1);
+  let birdBandMax1 = -Infinity;
+  for (let i=loBird1;i<=hiBird1;i++){ const v=tmp[i]; if (Number.isFinite(v) && v>birdBandMax1) birdBandMax1=v; }
 
   logLine(`diag: analysisPaused=${analyzer.audio.paused} ctx=${analyzer.audioCtx.state} dur=${secToHMS(analyzer.duration)}`);
-  logLine(`diag@${secToHMS(t0)}: finite=${s0.finite}/${s0.n} -Inf=${s0.negInf} NaN=${s0.nan} max=${Number.isFinite(s0.max)?s0.max.toFixed(1):String(s0.max)} min=${Number.isFinite(s0.min)?s0.min.toFixed(1):String(s0.min)} byteMax=${maxB0}`);
-  logLine(`diag@${secToHMS(t1)}: finite=${s1.finite}/${s1.n} -Inf=${s1.negInf} NaN=${s1.nan} max=${Number.isFinite(s1.max)?s1.max.toFixed(1):String(s1.max)} min=${Number.isFinite(s1.min)?s1.min.toFixed(1):String(s1.min)} byteMax=${maxB1}`);
-  logLine('diag: max がずっと minDb 付近なら「解析音が入ってない（無音/デコード失敗/シーク未反映）」です');
+  logLine(`diag@${secToHMS(t0)}: finite=${s0.finite}/${s0.n} -Inf=${s0.negInf} NaN=${s0.nan} max=${Number.isFinite(s0.max)?s0.max.toFixed(1):String(s0.max)} min=${Number.isFinite(s0.min)?s0.min.toFixed(1):String(s0.min)} byteMax=${maxB0} birdMax=${Number.isFinite(birdBandMax0)?birdBandMax0.toFixed(1):String(birdBandMax0)}`);
+  logLine(`diag@${secToHMS(t1)}: finite=${s1.finite}/${s1.n} -Inf=${s1.negInf} NaN=${s1.nan} max=${Number.isFinite(s1.max)?s1.max.toFixed(1):String(s1.max)} min=${Number.isFinite(s1.min)?s1.min.toFixed(1):String(s1.min)} byteMax=${maxB1} birdMax=${Number.isFinite(birdBandMax1)?birdBandMax1.toFixed(1):String(birdBandMax1)}`);
+  if (Number.isFinite(birdBandMax0) && birdBandMax0 < cfg.minDb){
+    logLine('diag: 鳥帯域のピークが minDb より下です → 自動コントラストON推奨');
+  }
 }
 
 /** ====== Scan (trigger detection) ====== */
@@ -1083,6 +1115,16 @@ async function runScanAsync(){
         await seekAndWait(analyzer.audio, clamp(t, 0, Math.max(0, analyzer.duration-0.001)), 650);
         if (analyzer.audio.paused){ try{ await analyzer.audio.play(); analyzer.analysisPlaying = true; } catch {} }
         analyzer.analyser.getFloatFrequencyData(tmp);
+    // auto contrast: find peak in display band (0..cfg.maxHz)
+    let colMax = -Infinity;
+    if (cfg.autoContrast){
+      const binHz = analyzer.audioCtx.sampleRate / cfg.fftSize;
+      const maxBi = clamp(Math.round(cfg.maxHz / binHz), 0, bins-1);
+      for (let bi=0; bi<=maxBi; bi++){
+        const v = tmp[bi];
+        if (Number.isFinite(v) && v > colMax) colMax = v;
+      }
+    }
         meanDb = bandMeanDbFromSpectrum(tmp, cfg, minHz, maxHz);
 
         // peak for display
@@ -1210,5 +1252,5 @@ function wire(){
 
 wire();
 window.__diagClick = () => { logLine('diag: clicked'); try{ runDiagnostics(); } catch(e){ logLine('diag: exception ' + (e?.message ?? e)); } };
-logLine('[boot] v2.5.7 loaded (1771579762)');
+logLine('[boot] v2.6.1 loaded (1771580890) (1771580439) (1771579762)');
 clearAll();
