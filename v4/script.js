@@ -37,6 +37,7 @@ const UI = {
   scanMinHzVal: document.getElementById('scanMinHzVal'),
   scanMaxHzVal: document.getElementById('scanMaxHzVal'),
   scanThresholdVal: document.getElementById('scanThresholdVal'),
+  scanSegSec: document.getElementById('scanSegSec'),
   presetNight: document.getElementById('presetNight'),
   presetOwl: document.getElementById('presetOwl'),
   presetTora: document.getElementById('presetTora'),
@@ -981,16 +982,24 @@ function wireScanSliders(){
     syncAll();
   });
 
-  // presets (delta dB)
-  const setPreset = (min, max, thrDelta) => {
+  // presets (min/max Hz, segSec, thrDelta dB)
+  const setPreset = (min, max, segSec, thrDelta) => {
     UI.scanMinHz.value = String(min);
     UI.scanMaxHz.value = String(max);
     UI.scanThreshold.value = String(thrDelta);
+    if (UI.scanSegSec) UI.scanSegSec.value = String(segSec);
     syncAll();
   };
-  UI.presetNight?.addEventListener('click', () => setPreset(800, 4000, 10));
-  UI.presetOwl?.addEventListener('click', () => setPreset(400, 1200, 12));
-  UI.presetTora?.addEventListener('click', () => setPreset(2000, 2800, 15));
+  UI.presetNight?.addEventListener('click', () => setPreset(800, 4000, 2.0, 12));
+  UI.presetOwl?.addEventListener('click', () => setPreset(400, 1200, 3.0, 10));
+  UI.presetTora?.addEventListener('click', () => setPreset(2000, 2800, 1.0, 15));
+
+  // seg sec clamp
+  UI.scanSegSec?.addEventListener('input', () => {
+    const v = parseFloat(UI.scanSegSec.value);
+    if (!Number.isFinite(v)) return;
+    UI.scanSegSec.value = String(clamp(v, 0.5, 10.0));
+  });
 
   syncAll();
 }
@@ -1129,8 +1138,15 @@ function decodePcmMono(buffer, header){
   return mono;
 }
 
+
+function getScanSegSec(){
+  const v = parseFloat(UI.scanSegSec?.value ?? '2.0');
+  const seg = Number.isFinite(v) ? v : 2.0;
+  return clamp(seg, 0.5, 10.0);
+}
+
 async function scanBandWav(file){
-  const SEG_SEC = 5;
+  const SEG_SEC = getScanSegSec();
 
   setState('スキャン中');
   UI.scanBtn.disabled = true;
@@ -1143,7 +1159,7 @@ async function scanBandWav(file){
 
   const header = await readWavHeader(file);
   const bytesPerSec = header.sampleRate * header.blockAlign;
-  const segBytes = Math.floor(bytesPerSec * SEG_SEC);
+  const segBytes = Math.max(1, Math.floor(bytesPerSec * SEG_SEC));
   const totalSeg = Math.ceil(header.dataSize / segBytes);
 
   const FFT_N = 2048;
@@ -1158,11 +1174,14 @@ async function scanBandWav(file){
   const hi = Math.max(minHz, maxHz);
 
   const binHz = header.sampleRate / FFT_N;
-  const minBin = clamp(Math.floor(lo / binHz), 0, FFT_N/2);
-  const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
+  const minBin = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
+  const maxBin = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
+  const bins = Math.max(1, (maxBin - minBin + 1));
 
-  // ---- noise learn (seconds range) ----
-  let noiseFloorDb = -120;
+  // ---- noise learn (per-bin baseline dB) ----
+  let baselineDb = new Float32Array(bins);
+  baselineDb.fill(-120);
+
   try{
     const ns = parseFloat(UI.noiseStartSec?.value ?? '5');
     const ne = parseFloat(UI.noiseEndSec?.value ?? '7');
@@ -1179,7 +1198,6 @@ async function scanBandWav(file){
     const monoN = decodePcmMono(nab, header);
 
     const hopN = FFT_N >> 1;
-    const bins = (maxBin - minBin + 1);
     const acc = new Float64Array(bins);
     let framesN = 0;
 
@@ -1196,23 +1214,27 @@ async function scanBandWav(file){
       framesN++;
     }
 
-    let noiseFloorPow = 0;
     if (framesN > 0){
       for (let k=0;k<bins;k++){
-        const mean = acc[k] / framesN;
-        if (mean > noiseFloorPow) noiseFloorPow = mean;
+        const meanPow = acc[k] / framesN;
+        baselineDb[k] = 10 * Math.log10(meanPow + 1e-12);
       }
-      noiseFloorDb = 10 * Math.log10(noiseFloorPow + 1e-12);
+      // display: use median-ish (sorted mid) for logging
+      const tmpArr = Array.from(baselineDb);
+      tmpArr.sort((a,b)=>a-b);
+      const mid = tmpArr[Math.floor(tmpArr.length*0.5)];
+      logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / baseline≈${mid.toFixed(1)} dB (per-bin)`);
+    } else {
+      logLine('ノイズ学習: フレーム不足（baseline=-120dB扱い）');
     }
-    logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / floor≈${noiseFloorDb.toFixed(1)} dB`);
   } catch(e){
     logLine(`ノイズ学習失敗（継続）: ${e?.message ?? e}`);
-    noiseFloorDb = -120;
+    baselineDb.fill(-120);
   }
 
-  logLine(`スキャン開始: WAV ${header.sampleRate}Hz ch=${header.numChannels} bits=${header.bitsPerSample} / SEG=5s / FFT=${FFT_N}`);
+  logLine(`スキャン開始: WAV ${header.sampleRate}Hz ch=${header.numChannels} bits=${header.bitsPerSample} / SEG=${SEG_SEC.toFixed(2)}s / FFT=${FFT_N}`);
   logLine(`帯域: ${lo}..${hi} Hz / 検出感度(差分): +${thrDeltaDb} dB`);
-  logLine(`判定: 5秒内で1フレームでも (frameDb - noiseFloorDb) > +thr`);
+  logLine(`判定: SEG内で1フレームでも max( frameDb(bin) - baselineDb(bin) ) > +thr`);
 
   let lastDetectedBucket = -9999;
 
@@ -1224,8 +1246,19 @@ async function scanBandWav(file){
     const sliceStart = header.dataOffset + startByte;
     const sliceEnd = header.dataOffset + endByte;
 
-    const ab = await file.slice(sliceStart, sliceEnd).arrayBuffer();
-    const mono = decodePcmMono(ab, header);
+    const secAt = (startByte / bytesPerSec);
+
+    let mono;
+    try{
+      const ab = await file.slice(sliceStart, sliceEnd).arrayBuffer();
+      mono = decodePcmMono(ab, header);
+    } catch(e){
+      // decode error -> skip
+      logLine(`seg#${seg} decode失敗（スキップ）: ${e?.message ?? e}`);
+      setScanProgress((seg+1)/totalSeg*100);
+      await sleep(0);
+      continue;
+    }
 
     const hop = FFT_N >> 1;
     let detected = false;
@@ -1237,37 +1270,40 @@ async function scanBandWav(file){
       }
       fftInPlace(re, im, plan);
 
-      let frameMaxPow = 0;
+      let maxDiffDb = -9999;
       for (let b=minBin; b<=maxBin; b++){
         const rr = re[b], ii = im[b];
-        const p = rr*rr + ii*ii;
-        if (p > frameMaxPow) frameMaxPow = p;
+        const pow = rr*rr + ii*ii;
+        const frameDb = 10 * Math.log10(pow + 1e-12);
+        const diff = frameDb - baselineDb[b-minBin];
+        if (diff > maxDiffDb) maxDiffDb = diff;
       }
-      const frameDb = 10 * Math.log10(frameMaxPow + 1e-12);
-      if ((frameDb - noiseFloorDb) > thrDeltaDb){
-        detected = true;
-        break;
-      }
-      if (sig.aborted) break;
-    }
 
-    setScanProgress(((seg+1)/totalSeg)*100);
+      if (maxDiffDb >= thrDeltaDb) { detected = true; break; }
+      if (sig.aborted) throw new Error('スキャン中断');
+    }
 
     if (detected){
-      const bucket = seg;
+      const bucket = Math.floor(secAt / SEG_SEC);
       if (bucket !== lastDetectedBucket){
+        addDetectButton(secAt);
         lastDetectedBucket = bucket;
-        addDetectButton(bucket * SEG_SEC);
       }
     }
 
-    await sleep(0);
+    setScanProgress((seg+1)/totalSeg*100);
+    if (seg % 8 === 0) await sleep(0);
   }
+
+  logLine('スキャン完了');
+  setState('準備完了');
+  UI.scanAbortBtn.disabled = true;
 }
 
+
 async function scanBandDecode(file){
-  // MP3/AAC/OGG等: slice → decodeAudioData → FFT判定
-  const SEG_SEC = 5;
+  // MP3/AAC/OGG等: slice → decodeAudioData → FFT判定（境界デコード失敗はスキップして継続）
+  const SEG_SEC = getScanSegSec();
   const OVERLAP_SEC = 0.25;
 
   setState('スキャン中');
@@ -1303,8 +1339,11 @@ async function scanBandDecode(file){
   const audioCtx = analyzer.audioCtx;
   if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch {} }
 
-  // ---- noise learn (decode) ----
-  let noiseFloorDb = -120;
+  // ---- noise learn (decode / per-bin baseline dB) ----
+  let baselineDb = null;
+  let baselineSr = 0;
+  let minBin0 = 0, maxBin0 = 0;
+
   try{
     const ns = parseFloat(UI.noiseStartSec?.value ?? '5');
     const ne = parseFloat(UI.noiseEndSec?.value ?? '7');
@@ -1318,16 +1357,25 @@ async function scanBandDecode(file){
     const startByte = Math.max(0, Math.floor(startSec * bytesPerSecEst) - overlapBytes);
     const endByte = Math.min(file.size, Math.floor(endSec * bytesPerSecEst) + overlapBytes);
     const nab = await file.slice(startByte, endByte).arrayBuffer();
-    const nbuf = await audioCtx.decodeAudioData(nab);
-    const sr = nbuf.sampleRate;
+
+    let nbuf;
+    try{
+      nbuf = await audioCtx.decodeAudioData(nab);
+    } catch(e){
+      throw new Error(`背景ノイズ区間 decode失敗: ${e?.message ?? e}`);
+    }
+
+    baselineSr = nbuf.sampleRate;
     const monoN = nbuf.getChannelData(0);
 
-    const binHz = sr / FFT_N;
-    const minBin = clamp(Math.floor(lo / binHz), 0, FFT_N/2);
-    const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
+    const binHz = baselineSr / FFT_N;
+    minBin0 = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
+    maxBin0 = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
+    const bins = Math.max(1, (maxBin0 - minBin0 + 1));
+    baselineDb = new Float32Array(bins);
+    baselineDb.fill(-120);
 
     const hopN = FFT_N >> 1;
-    const bins = (maxBin - minBin + 1);
     const acc = new Float64Array(bins);
     let framesN = 0;
 
@@ -1337,31 +1385,32 @@ async function scanBandDecode(file){
         im[n] = 0;
       }
       fftInPlace(re, im, plan);
-      for (let b=minBin; b<=maxBin; b++){
+      for (let b=minBin0; b<=maxBin0; b++){
         const rr = re[b], ii = im[b];
-        acc[b-minBin] += rr*rr + ii*ii;
+        acc[b-minBin0] += rr*rr + ii*ii;
       }
       framesN++;
     }
 
-    let noiseFloorPow = 0;
     if (framesN > 0){
       for (let k=0;k<bins;k++){
-        const mean = acc[k] / framesN;
-        if (mean > noiseFloorPow) noiseFloorPow = mean;
+        baselineDb[k] = 10 * Math.log10((acc[k] / framesN) + 1e-12);
       }
-      noiseFloorDb = 10 * Math.log10(noiseFloorPow + 1e-12);
+      const tmpArr = Array.from(baselineDb).sort((a,b)=>a-b);
+      const mid = tmpArr[Math.floor(tmpArr.length*0.5)];
+      logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / baseline≈${mid.toFixed(1)} dB (per-bin)`);
+    } else {
+      logLine('ノイズ学習: フレーム不足（baseline=-120dB扱い）');
     }
-    logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / floor≈${noiseFloorDb.toFixed(1)} dB`);
   } catch(e){
-    console.warn('ノイズ学習失敗（継続）', e);
     logLine(`ノイズ学習失敗（継続）: ${e?.message ?? e}`);
-    noiseFloorDb = -120;
+    baselineDb = null;
+    baselineSr = 0;
   }
 
-  logLine(`スキャン開始: decode方式 / duration≈${duration.toFixed(2)}s / SEG=5s / FFT=${FFT_N}`);
+  logLine(`スキャン開始: decode方式 / duration≈${duration.toFixed(2)}s / SEG=${SEG_SEC.toFixed(2)}s / FFT=${FFT_N}`);
   logLine(`帯域: ${lo}..${hi} Hz / 検出感度(差分): +${thrDeltaDb} dB`);
-  logLine(`判定: 5秒内で1フレームでも (frameDb - noiseFloorDb) > +thr`);
+  logLine(`判定: SEG内で1フレームでも max( frameDb(bin) - baselineDb(bin) ) > +thr`);
 
   let lastDetectedBucket = -9999;
 
@@ -1369,70 +1418,90 @@ async function scanBandDecode(file){
     if (sig.aborted) throw new Error('スキャン中断');
 
     const segStartSec = seg * SEG_SEC;
+    const segEndSec = Math.min(duration, segStartSec + SEG_SEC);
+
+    // byte range (approx, with overlap)
     const startByte = Math.max(0, Math.floor(segStartSec * bytesPerSecEst) - overlapBytes);
-    const endByte = Math.min(file.size, startByte + segBytes + overlapBytes);
+    const endByte = Math.min(file.size, Math.floor(segEndSec * bytesPerSecEst) + overlapBytes);
 
-    let arrayBuf = null;
-
+    let ab, buf;
     try{
-      arrayBuf = await file.slice(startByte, endByte).arrayBuffer();
-      const audioBuf = await audioCtx.decodeAudioData(arrayBuf);
-      const sr = audioBuf.sampleRate;
-      const mono = audioBuf.getChannelData(0);
-
-      const binHz = sr / FFT_N;
-      const minBin = clamp(Math.floor(lo / binHz), 0, FFT_N/2);
-      const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
-
-      const hop = FFT_N >> 1;
-      let detected = false;
-
-      for (let i=0; i + FFT_N <= mono.length; i += hop){
-        for (let n=0;n<FFT_N;n++){
-          re[n] = mono[i+n] * hannWindow(n, FFT_N);
-          im[n] = 0;
-        }
-        fftInPlace(re, im, plan);
-
-        let frameMaxPow = 0;
-        for (let b=minBin; b<=maxBin; b++){
-          const rr = re[b], ii = im[b];
-          const p = rr*rr + ii*ii;
-          if (p > frameMaxPow) frameMaxPow = p;
-        }
-        const frameDb = 10 * Math.log10(frameMaxPow + 1e-12);
-        if ((frameDb - noiseFloorDb) > thrDeltaDb){
-          detected = true;
-          break;
-        }
-        if (sig.aborted) break;
-      }
-
-      if (detected){
-        const bucket = seg;
-        if (bucket !== lastDetectedBucket){
-          lastDetectedBucket = bucket;
-          addDetectButton(bucket * SEG_SEC);
-        }
-      }
+      ab = await file.slice(startByte, endByte).arrayBuffer();
     } catch(e){
-      console.warn('デコード失敗、スキップします', e);
-      logLine(`seg#${seg} decode失敗（skip）: ${e?.message ?? e}`);
-    } finally {
-      arrayBuf = null;
+      logLine(`seg#${seg} slice失敗（スキップ）: ${e?.message ?? e}`);
+      setScanProgress((seg+1)/totalSeg*100);
+      await sleep(0);
+      continue;
     }
 
-    setScanProgress(((seg+1)/totalSeg)*100);
-    await sleep(0);
+    try{
+      buf = await audioCtx.decodeAudioData(ab);
+    } catch(e){
+      // boundary decode fail -> skip
+      logLine(`seg#${seg} decode失敗（スキップ）: ${e?.message ?? e}`);
+      setScanProgress((seg+1)/totalSeg*100);
+      await sleep(0);
+      continue;
+    }
+
+    const sr = buf.sampleRate;
+    const mono = buf.getChannelData(0);
+
+    const binHz = sr / FFT_N;
+    const minBin = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
+    const maxBin = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
+
+    // baseline mismatch -> fallback
+    const useBaseline = (baselineDb && baselineSr === sr && minBin === minBin0 && maxBin === maxBin0);
+
+    const hop = FFT_N >> 1;
+    let detected = false;
+
+    for (let i=0; i + FFT_N <= mono.length; i += hop){
+      for (let n=0;n<FFT_N;n++){
+        re[n] = mono[i+n] * hannWindow(n, FFT_N);
+        im[n] = 0;
+      }
+      fftInPlace(re, im, plan);
+
+      let maxDiffDb = -9999;
+      for (let b=minBin; b<=maxBin; b++){
+        const rr = re[b], ii = im[b];
+        const pow = rr*rr + ii*ii;
+        const frameDb = 10 * Math.log10(pow + 1e-12);
+        const base = useBaseline ? baselineDb[b-minBin] : -120;
+        const diff = frameDb - base;
+        if (diff > maxDiffDb) maxDiffDb = diff;
+      }
+
+      if (maxDiffDb >= thrDeltaDb) { detected = true; break; }
+      if (sig.aborted) throw new Error('スキャン中断');
+    }
+
+    if (detected){
+      const bucket = Math.floor(segStartSec / SEG_SEC);
+      if (bucket !== lastDetectedBucket){
+        addDetectButton(segStartSec);
+        lastDetectedBucket = bucket;
+      }
+    }
+
+    setScanProgress((seg+1)/totalSeg*100);
+    if (seg % 4 === 0) await sleep(0);
   }
+
+  logLine('スキャン完了');
+  setState('準備完了');
+  UI.scanAbortBtn.disabled = true;
 }
+
 
 async function scanBand(file){
   try{
     // WAV header check; if fails, fall back to decode方式（MP3等）
     try{
       await readWavHeader(file);
-      await scanBand(file);
+      await scanBandWav(file);
     } catch(e){
       await scanBandDecode(file);
     }
@@ -1450,7 +1519,7 @@ UI.scanBtn.addEventListener('click', async () => {
   if (!file) { alert('音声ファイルを選択してください'); return; }
 
   try {
-    await scanBand(file);
+    await scanBandWav(file);
   } catch (e) {
     const msg = e?.message ?? String(e);
     logLine(`スキャン停止: ${msg}`);
