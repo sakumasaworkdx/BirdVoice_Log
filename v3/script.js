@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * v2.5.2
+ * v2.5.3
  * - 読み込み/準備が反応しない原因のほとんどは「index.html と script.js の不一致」です。
  *   このスクリプトは、要素が無い場合でも落ちないようにガードしてあります。
  */
@@ -30,6 +30,7 @@ const FEATURE_BANDS = 48;
 const UI = {
   fileInput: document.getElementById('fileInput'),
   prepareBtn: document.getElementById('prepareBtn'),
+  diagBtn: document.getElementById('diagBtn'),
   playBtn: document.getElementById('playBtn'),
   pauseBtn: document.getElementById('pauseBtn'),
   stopBtn: document.getElementById('stopBtn'),
@@ -163,6 +164,7 @@ const analyzer = {
   audioCtx: null,
   analyser: null,
   srcNode: null,
+  gain0: null,
 
   analysisPlaying: false, // muted analysis loop
 };
@@ -174,7 +176,9 @@ function clearAll(){
 
   // disconnect audio graph
   try { analyzer.srcNode?.disconnect(); } catch {}
+  try { analyzer.srcNode?.disconnect(); } catch {}
   try { analyzer.analyser?.disconnect(); } catch {}
+  try { analyzer.gain0?.disconnect(); } catch {}
   try { analyzer.audioCtx?.close(); } catch {}
 
   analyzer.inited = false;
@@ -382,8 +386,11 @@ async function ensureAudioGraph(){
   analyzer.audio.volume = 0;
 
   analyzer.srcNode = analyzer.audioCtx.createMediaElementSource(analyzer.audio);
+  analyzer.gain0 = analyzer.audioCtx.createGain();
+  analyzer.gain0.gain.value = 0;
   analyzer.srcNode.connect(analyzer.analyser);
-  analyzer.analyser.connect(analyzer.audioCtx.destination);
+  analyzer.analyser.connect(analyzer.gain0);
+  analyzer.gain0.connect(analyzer.audioCtx.destination);
 }
 
 async function prepare(){
@@ -527,7 +534,8 @@ async function generateTileBitmap(tileIndex, cfg, signal){
       const hz = yToFreq(cfg, y, height);
       const binHz = analyzer.audioCtx.sampleRate / cfg.fftSize;
       const bi = clamp(Math.round(hz / binHz), 0, bins-1);
-      const db = tmp[bi];
+      let db = tmp[bi];
+      if (!Number.isFinite(db)) db = cfg.minDb; // -Infinity 対策
       const v = (db - cfg.minDb) / (cfg.maxDb - cfg.minDb);
       const tcol = clamp01(v);
       const rgb = mapColor(cfg.cmap, tcol);
@@ -891,6 +899,57 @@ async function exportRangePNG(){
   } finally {
     if (UI.exportRangeBtn) UI.exportRangeBtn.disabled = false;
   }
+}
+
+
+function spectrumStats(tmp){
+  let max = -Infinity, min = Infinity;
+  let finite = 0;
+  for (let i=0;i<tmp.length;i++){
+    const v = tmp[i];
+    if (Number.isFinite(v)){
+      finite++;
+      if (v>max) max=v;
+      if (v<min) min=v;
+    }
+  }
+  return { max, min, finite, n: tmp.length };
+}
+
+async function runDiagnostics(){
+  if (!analyzer.inited){
+    logLine('diag: 未準備（先に 読み込み/準備）');
+    return;
+  }
+  const cfg = getConfig();
+  analyzer.analyser.fftSize = cfg.fftSize;
+  analyzer.analyser.minDecibels = cfg.minDb;
+  analyzer.analyser.maxDecibels = cfg.maxDb;
+  analyzer.analyser.smoothingTimeConstant = 0;
+
+  const bins = analyzer.analyser.frequencyBinCount;
+  const tmp = new Float32Array(bins);
+
+  const range = getViewportRange(cfg);
+  const t0 = clamp(range.startSec, 0, Math.max(0, analyzer.duration-0.001));
+  const t1 = clamp(t0 + 1.0, 0, Math.max(0, analyzer.duration-0.001));
+
+  // make sure analysis element is playing
+  try{ if (analyzer.audioCtx?.state === 'suspended') await analyzer.audioCtx.resume(); } catch {}
+  if (analyzer.audio?.paused){ try{ await analyzer.audio.play(); analyzer.analysisPlaying = true; } catch {} }
+
+  await seekAndWait(analyzer.audio, t0, 800);
+  analyzer.analyser.getFloatFrequencyData(tmp);
+  const s0 = spectrumStats(tmp);
+
+  await seekAndWait(analyzer.audio, t1, 800);
+  analyzer.analyser.getFloatFrequencyData(tmp);
+  const s1 = spectrumStats(tmp);
+
+  logLine(`diag: analysisPaused=${analyzer.audio.paused} ctx=${analyzer.audioCtx.state} dur=${secToHMS(analyzer.duration)}`);
+  logLine(`diag@${secToHMS(t0)}: finite=${s0.finite}/${s0.n} max=${s0.max.toFixed(1)} min=${s0.min.toFixed(1)}`);
+  logLine(`diag@${secToHMS(t1)}: finite=${s1.finite}/${s1.n} max=${s1.max.toFixed(1)} min=${s1.min.toFixed(1)}`);
+  logLine('diag: max がずっと minDb 付近なら「解析音が入ってない（無音/デコード失敗/シーク未反映）」です');
 }
 
 /** ====== Scan (trigger detection) ====== */
