@@ -339,10 +339,10 @@ function hzToY(hz, cfg, plotH) {
 }
 
 function drawAxis(ctx, cfg, plotH) {
-  ctx.fillStyle = '#f7f7f7';
+  ctx.fillStyle = '#111827';
   ctx.fillRect(0,0,AXIS_W,UI.specCanvas.height);
 
-  ctx.strokeStyle = 'rgba(0,0,0,.08)';
+  ctx.strokeStyle = 'rgba(255,255,255,.12)';
   ctx.beginPath();
   ctx.moveTo(AXIS_W + 0.5, 0);
   ctx.lineTo(AXIS_W + 0.5, UI.specCanvas.height);
@@ -351,9 +351,9 @@ function drawAxis(ctx, cfg, plotH) {
   const range = cfg.maxHz - cfg.minHz;
   const step = (range <= 6000) ? 500 : 1000;
 
-  ctx.fillStyle = 'rgba(0,0,0,.70)';
+  ctx.fillStyle = 'rgba(200,210,230,.85)';
   ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
-  ctx.strokeStyle = `rgba(0,0,0,${GRID_ALPHA})`;
+  ctx.strokeStyle = `rgba(255,255,255,${GRID_ALPHA})`;
   ctx.lineWidth = 1;
 
   for (let hz = Math.ceil(cfg.minHz/step)*step; hz <= cfg.maxHz; hz += step) {
@@ -367,7 +367,7 @@ function drawAxis(ctx, cfg, plotH) {
     ctx.fillText(`${khz}`, 10, y + 4);
   }
 
-  ctx.fillStyle = 'rgba(0,0,0,.55)';
+  ctx.fillStyle = 'rgba(150,165,200,.7)';
   ctx.fillText('kHz', 10, 16);
 }
 
@@ -377,7 +377,7 @@ function drawTimeTopGrid(ctx, cfg, viewStartSec, viewEndSec) {
   const step = (spanSec <= 20) ? 1 : (spanSec <= 120 ? 5 : 10);
 
   ctx.save();
-  ctx.strokeStyle = `rgba(0,0,0,${GRID_ALPHA})`;
+  ctx.strokeStyle = `rgba(255,255,255,${GRID_ALPHA})`;
   ctx.lineWidth = 1;
 
   const first = Math.floor(viewStartSec/step)*step;
@@ -391,7 +391,7 @@ function drawTimeTopGrid(ctx, cfg, viewStartSec, viewEndSec) {
   ctx.restore();
 
   ctx.save();
-  ctx.fillStyle = 'rgba(0,0,0,.60)';
+  ctx.fillStyle = 'rgba(200,210,230,.80)';
   ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
   for (let t=first; t<=viewEndSec; t+=step){
     const x = plotX0 + (t - viewStartSec) * cfg.pxPerSec;
@@ -450,126 +450,127 @@ async function generateTileBitmap(tileIndex, cfg, abortSignal) {
   const tileEnd   = Math.min(analyzer.duration, tileStart + cfg.tileSec);
   const targetSeconds = tileEnd - tileStart;
 
-  if (!analyzer.file)     throw new Error('ファイル未ロード');
-  if (!analyzer.audioCtx) throw new Error('audioCtx未初期化');
-  if (analyzer.audioCtx.state === 'suspended') {
-    try { await analyzer.audioCtx.resume(); } catch {}
-  }
+  if (!analyzer.file) throw new Error('ファイル未ロード');
 
-  // ── ファイルのバイト範囲をスライスしてデコード ──────────────────────
-  const bytesPerSecEst = analyzer.file.size / Math.max(1, analyzer.duration);
-  const overlapBytes   = Math.floor(bytesPerSecEst * 0.4);
-  const startByte = Math.max(0, Math.floor(tileStart * bytesPerSecEst) - overlapBytes);
-  const endByte   = Math.min(analyzer.file.size, Math.ceil(tileEnd * bytesPerSecEst) + overlapBytes);
+  // ── デコード専用の使い捨て AudioContext を使う ─────────────────────
+  // analyzer.audioCtx には createMediaElementSource が接続されており、
+  // Chrome では同一コンテキストで decodeAudioData が失敗するケースがある。
+  // 専用コンテキストを都度作成 → 完了後に close() して GC させる。
+  const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+  try {
+    const bytesPerSecEst = analyzer.file.size / Math.max(1, analyzer.duration);
+    const overlapBytes   = Math.floor(bytesPerSecEst * 0.6); // 余裕を持った重複
+    const startByte = Math.max(0, Math.floor(tileStart * bytesPerSecEst) - overlapBytes);
+    const endByte   = Math.min(analyzer.file.size, Math.ceil(tileEnd * bytesPerSecEst) + overlapBytes);
 
-  if (abortSignal?.aborted) throw new Error('abort');
-  const ab  = await analyzer.file.slice(startByte, endByte).arrayBuffer();
-  if (abortSignal?.aborted) throw new Error('abort');
-  const buf = await analyzer.audioCtx.decodeAudioData(ab);
-  if (abortSignal?.aborted) throw new Error('abort');
-
-  const sr   = buf.sampleRate;
-  const mono = buf.getChannelData(0);
-
-  // ── FFT 準備 ─────────────────────────────────────────────────────────
-  const FFT_N   = clamp(nextPow2(cfg.fftSize), 512, 4096);
-  const halfFFT = (FFT_N >> 1) - 1;
-  const plan    = makeFft(FFT_N);
-  const re      = new Float32Array(FFT_N);
-  const im      = new Float32Array(FFT_N);
-  const binHz   = sr / FFT_N;
-
-  // LUT 1: Hann窓（cos計算を事前に1回だけ）
-  const hannLUT = new Float32Array(FFT_N);
-  for (let n = 0; n < FFT_N; n++) {
-    hannLUT[n] = 0.5 * (1.0 - Math.cos((2 * Math.PI * n) / (FFT_N - 1)));
-  }
-
-  // LUT 2: y座標 → FFT binインデックス（log計算を事前に1回だけ）
-  const height = TILE_H;
-  const binLUT = new Int32Array(height);
-  for (let y = 0; y < height; y++) {
-    binLUT[y] = clamp(Math.round(yToHzByScale(y, cfg, height) / binHz), 0, halfFFT);
-  }
-
-  // LUT 3: カラーパレット（mapColor呼び出しを事前に1回だけ）
-  const CLUT_N   = 1024;
-  const CLUT_MAX = CLUT_N - 1;
-  const colorLUT = new Uint8Array(CLUT_N * 3);
-  for (let i = 0; i < CLUT_N; i++) {
-    const [r, g, b] = mapColor(cfg.colorMap, i / CLUT_MAX);
-    colorLUT[i * 3] = r; colorLUT[i * 3 + 1] = g; colorLUT[i * 3 + 2] = b;
-  }
-
-  // ── キャンバス準備 ────────────────────────────────────────────────────
-  const samplesPerCol = Math.max(1, Math.floor(sr / cfg.fps));
-  const width         = Math.max(1, Math.floor(targetSeconds * cfg.fps));
-
-  const oc = (typeof OffscreenCanvas !== 'undefined')
-    ? new OffscreenCanvas(width, height)
-    : (() => { const c = document.createElement('canvas'); c.width=width; c.height=height; return c; })();
-
-  const ctx     = oc.getContext('2d', { willReadFrequently: false });
-  const imgData = ctx.createImageData(width, height);
-  const data    = imgData.data;
-
-  // dB計算定数（Web Audio AnalyserNode と同じスケールに正規化）
-  const LOG10_SCALE = 10.0 / Math.LN10;
-  const invRange    = 1.0 / Math.max(1e-6, cfg.maxDb - cfg.minDb);
-  const minDb       = cfg.minDb;
-  const normDb      = 20.0 * Math.log10(2.0 / FFT_N); // AnalyserNode正規化補正
-
-  // alpha を一括 255 初期化
-  for (let i = 3; i < data.length; i += 4) data[i] = 255;
-
-  const stride = width * 4;
-
-  for (let x = 0; x < width; x++) {
+    if (abortSignal?.aborted) throw new Error('abort');
+    const ab  = await analyzer.file.slice(startByte, endByte).arrayBuffer();
+    if (abortSignal?.aborted) throw new Error('abort');
+    const buf = await decodeCtx.decodeAudioData(ab);
     if (abortSignal?.aborted) throw new Error('abort');
 
-    const sampleStart = x * samplesPerCol;
-    const xBase       = x * 4;
+    const sr   = buf.sampleRate;
+    const mono = buf.getChannelData(0);
 
-    if (sampleStart + FFT_N > mono.length) {
-      // 末尾不足: 直前列をコピー
-      if (x > 0) {
-        const prev = (x - 1) * 4;
-        for (let y = 0; y < height; y++) {
-          const row = y * stride;
-          data[row + xBase]     = data[row + prev];
-          data[row + xBase + 1] = data[row + prev + 1];
-          data[row + xBase + 2] = data[row + prev + 2];
-        }
-      }
-      continue;
-    }
+    // ── FFT 準備 ───────────────────────────────────────────────────────
+    const FFT_N   = clamp(nextPow2(cfg.fftSize), 512, 4096);
+    const halfFFT = (FFT_N >> 1) - 1;
+    const plan    = makeFft(FFT_N);
+    const re      = new Float32Array(FFT_N);
+    const im      = new Float32Array(FFT_N);
+    const binHz   = sr / FFT_N;
 
-    // Hann窓 + FFT
+    // LUT 1: Hann窓
+    const hannLUT = new Float32Array(FFT_N);
     for (let n = 0; n < FFT_N; n++) {
-      re[n] = mono[sampleStart + n] * hannLUT[n];
-      im[n] = 0;
+      hannLUT[n] = 0.5 * (1.0 - Math.cos((2 * Math.PI * n) / (FFT_N - 1)));
     }
-    fftInPlace(re, im, plan);
 
-    // ピクセル塗り（LUTで高速）
+    // LUT 2: y座標 → FFT bin
+    const height = TILE_H;
+    const binLUT = new Int32Array(height);
     for (let y = 0; y < height; y++) {
-      const bin = binLUT[y];
-      const rr  = re[bin], ii = im[bin];
-      const db  = LOG10_SCALE * Math.log(rr * rr + ii * ii + 1e-12) + normDb;
-      const ci  = clamp(((db - minDb) * invRange * CLUT_MAX + 0.5) | 0, 0, CLUT_MAX) * 3;
-      const idx = y * stride + xBase;
-      data[idx]     = colorLUT[ci];
-      data[idx + 1] = colorLUT[ci + 1];
-      data[idx + 2] = colorLUT[ci + 2];
+      binLUT[y] = clamp(Math.round(yToHzByScale(y, cfg, height) / binHz), 0, halfFFT);
     }
 
-    // 64列ごとに1tick yield（UIフリーズ防止、回数を最小化）
-    if ((x & 63) === 63) await sleep(0);
-  }
+    // LUT 3: カラーパレット
+    const CLUT_N   = 1024;
+    const CLUT_MAX = CLUT_N - 1;
+    const colorLUT = new Uint8Array(CLUT_N * 3);
+    for (let i = 0; i < CLUT_N; i++) {
+      const [r, g, b] = mapColor(cfg.colorMap, i / CLUT_MAX);
+      colorLUT[i * 3] = r; colorLUT[i * 3 + 1] = g; colorLUT[i * 3 + 2] = b;
+    }
 
-  ctx.putImageData(imgData, 0, 0);
-  const bitmap = await createImageBitmap(oc);
-  return { bitmap, width, height, tileIndex, tileStart, tileSec: cfg.tileSec, lastUsed: nowMs() };
+    // ── キャンバス準備 ──────────────────────────────────────────────────
+    const samplesPerCol = Math.max(1, Math.floor(sr / cfg.fps));
+    const width         = Math.max(1, Math.floor(targetSeconds * cfg.fps));
+
+    const oc = (typeof OffscreenCanvas !== 'undefined')
+      ? new OffscreenCanvas(width, height)
+      : (() => { const c = document.createElement('canvas'); c.width=width; c.height=height; return c; })();
+
+    const ctx     = oc.getContext('2d', { willReadFrequently: false });
+    const imgData = ctx.createImageData(width, height);
+    const data    = imgData.data;
+
+    // dB正規化定数（Web Audio AnalyserNode に合わせる）
+    const LOG10_SCALE = 10.0 / Math.LN10;
+    const invRange    = 1.0 / Math.max(1e-6, cfg.maxDb - cfg.minDb);
+    const minDb       = cfg.minDb;
+    const normDb      = 20.0 * Math.log10(2.0 / FFT_N);
+
+    for (let i = 3; i < data.length; i += 4) data[i] = 255;
+
+    const stride = width * 4;
+
+    for (let x = 0; x < width; x++) {
+      if (abortSignal?.aborted) throw new Error('abort');
+
+      const sampleStart = x * samplesPerCol;
+      const xBase       = x * 4;
+
+      if (sampleStart + FFT_N > mono.length) {
+        if (x > 0) {
+          const prev = (x - 1) * 4;
+          for (let y = 0; y < height; y++) {
+            const row = y * stride;
+            data[row + xBase]     = data[row + prev];
+            data[row + xBase + 1] = data[row + prev + 1];
+            data[row + xBase + 2] = data[row + prev + 2];
+          }
+        }
+        continue;
+      }
+
+      for (let n = 0; n < FFT_N; n++) {
+        re[n] = mono[sampleStart + n] * hannLUT[n];
+        im[n] = 0;
+      }
+      fftInPlace(re, im, plan);
+
+      for (let y = 0; y < height; y++) {
+        const bin = binLUT[y];
+        const rr  = re[bin], ii = im[bin];
+        const db  = LOG10_SCALE * Math.log(rr * rr + ii * ii + 1e-12) + normDb;
+        const ci  = clamp(((db - minDb) * invRange * CLUT_MAX + 0.5) | 0, 0, CLUT_MAX) * 3;
+        const idx = y * stride + xBase;
+        data[idx]     = colorLUT[ci];
+        data[idx + 1] = colorLUT[ci + 1];
+        data[idx + 2] = colorLUT[ci + 2];
+      }
+
+      if ((x & 63) === 63) await sleep(0);
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+    const bitmap = await createImageBitmap(oc);
+    return { bitmap, width, height, tileIndex, tileStart, tileSec: cfg.tileSec, lastUsed: nowMs() };
+
+  } finally {
+    // 必ず close して AudioContext を解放（メモリリーク防止）
+    try { decodeCtx.close(); } catch {}
+  }
 }
 
 /** ===================== View rendering ===================== */
@@ -637,7 +638,7 @@ function renderViewport(targetCanvas) {
   if (targetCanvas === UI.specCanvas) resizeCanvasToViewport();
 
   const ctx = targetCanvas.getContext('2d', { alpha:false, willReadFrequently:false });
-  ctx.fillStyle = '#ffffff';
+  ctx.fillStyle = '#0b0f1c';
   ctx.fillRect(0,0,targetCanvas.width, targetCanvas.height);
 
   const plotH = Math.max(1, targetCanvas.height - PAD_T - PAD_B);
