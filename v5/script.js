@@ -1437,6 +1437,13 @@ async function scanBand(file){
     // ここは停止ではなくフォールバック
     logLine('非WAV形式 → decode方式でスキャン');
     await scanBandDecode(file);
+  } finally {
+    // UI復帰は必ず
+    UI.scanBtn.disabled = false;
+    UI.scanAbortBtn.disabled = true;
+    scanAbortCtrl = null;
+    setState('準備完了');
+    setScanProgress(0);
   }
 }
 
@@ -1462,6 +1469,6 @@ UI.scanAbortBtn.addEventListener('click', () => {
   if (scanAbortCtrl) scanAbortCtrl.abort();
 });
 
-wireScanSliders();
+try{ wireScanSliders(); } catch(e){ console.error(e); logLine('初期化エラー(wireScanSliders): '+(e?.message??e)); }
 
-clearAll();
+try{ clearAll(); } catch(e){ console.error(e); }
