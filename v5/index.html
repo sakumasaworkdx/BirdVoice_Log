@@ -134,7 +134,7 @@
 <body>
   <header>
     <div class="title">
-      <h1>野鳥の鳴き声 解析・可視化（WaveTone風タイムライン v2）</h1>
+      <h1>野鳥の鳴き声 解析・可視化（WaveTone風タイムライン v2） <span id="buildLabel" class="pill" style="font-size:12px;opacity:.85;">BirdVoice_Log v5 (fix v14) 2026-02-23</span></h1>
       <span class="badge">色マップ</span>
       <span class="badge">対数周波数</span>
       <span class="badge">鳥声帯域強調</span>
@@ -231,6 +231,7 @@
             <button id="pauseBtn" class="secondary" disabled>一時停止</button>
             <button id="stopBtn" class="danger" disabled>停止</button>
             <button id="exportViewBtn" class="secondary" disabled>PNG保存（表示中）</button>
+            <button id="exportAllZipBtn" class="secondary" disabled>全件ZIP保存</button>
             <button id="clearBtn" class="secondary">クリア</button>
           </div>
         </div>
@@ -286,7 +287,7 @@
           <div class="row" style="margin-top:10px">
             <span class="pill mono">解析単位(秒)</span>
             <input id="scanSegSec" type="number" min="0.5" max="30" step="0.1" value="2.0" />
-            <span class="pill mono">（0.5〜30.0）</span>
+            <span class="pill mono">（0.5〜10.0）</span>
             <div class="flex-grow"></div>
           </div>
 

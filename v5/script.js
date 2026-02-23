@@ -1,5 +1,13 @@
 /* eslint-disable no-console */
-'use strict';
+\1
+
+/* BUILD_LABEL__FIXV14 */
+const BUILD_LABEL = 'BirdVoice_Log v5 (fix v14) 2026-02-23';
+try {
+  console.log('[boot]', BUILD_LABEL);
+  const bl = document.getElementById('buildLabel');
+  if (bl) bl.textContent = BUILD_LABEL;
+} catch(_e) {}
 
 /**
  * v2 追加
@@ -54,6 +62,7 @@ const UI = {
   pauseBtn: document.getElementById('pauseBtn'),
   stopBtn: document.getElementById('stopBtn'),
   exportViewBtn: document.getElementById('exportViewBtn'),
+  exportAllZipBtn: document.getElementById('exportAllZipBtn'),
   clearBtn: document.getElementById('clearBtn'),
 
   barFill: document.getElementById('barFill'),
@@ -733,6 +742,166 @@ async function exportVisiblePNG() {
   } finally {
     UI.exportViewBtn.disabled = false;
   }
+function pad2(n){ return String(n).padStart(2,'0'); }
+function fileStampFromSec(sec){
+  const t = Math.max(0, sec|0);
+  const hh = pad2(Math.floor(t/3600));
+  const mm = pad2(Math.floor((t%3600)/60));
+  const ss = pad2(t%60);
+  return `${hh}-${mm}-${ss}`;
+}
+
+async function ensureTilesReadyForRange(cfg, range){
+  const startIdx = Math.floor(range.startSec / cfg.tileSec);
+  const endIdx = Math.floor(range.endSec / cfg.tileSec);
+  for (let ti = startIdx; ti <= endIdx; ti++){
+    const key = makeTileKey(ti, cfg);
+    const hit = tileCache.get(key);
+    if (hit) { hit.lastUsed = nowMs(); continue; }
+    // generate synchronously for export
+    const tile = await generateTileBitmap(ti, cfg, null);
+    tileCache.set(key, tile);
+    tile.lastUsed = nowMs();
+    // yield to avoid freezing
+    await new Promise(r => setTimeout(r, 0));
+  }
+}
+
+function renderRangeToCanvas(targetCanvas, startSec, endSec, cfg){
+  if (!analyzer.inited) return;
+  const ctx = targetCanvas.getContext('2d', { alpha:false, willReadFrequently:false });
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,targetCanvas.width, targetCanvas.height);
+
+  const plotH = Math.max(1, targetCanvas.height - PAD_T - PAD_B);
+  const range = { startSec, endSec };
+
+  // axis + grids
+  drawAxis(ctx, cfg, plotH);
+  drawTimeTopGrid(ctx, cfg, range.startSec, range.endSec);
+
+  // optional highlight
+  drawBandHighlight(ctx, cfg, plotH);
+
+  // ensure tiles ready
+  // (caller should await ensureTilesReadyForRange)
+
+  const startIdx = Math.floor(range.startSec / cfg.tileSec);
+  const endIdx = Math.floor(range.endSec / cfg.tileSec);
+  const plotX0 = AXIS_W;
+
+  for (let ti = startIdx; ti <= endIdx; ti++){
+    const key = makeTileKey(ti, cfg);
+    const tile = tileCache.get(key);
+    if (!tile) continue;
+    tile.lastUsed = nowMs();
+
+    const tileStart = ti * cfg.tileSec;
+    const tileEnd = tileStart + cfg.tileSec;
+    const drawStart = Math.max(range.startSec, tileStart);
+    const drawEnd = Math.min(range.endSec, tileEnd);
+    if (drawEnd <= drawStart) continue;
+
+    const srcX0 = (drawStart - tileStart) * cfg.fps;
+    const srcX1 = (drawEnd - tileStart) * cfg.fps;
+    const srcW = Math.max(1, srcX1 - srcX0);
+
+    const dstX0 = plotX0 + (drawStart - range.startSec) * cfg.pxPerSec;
+    const dstW = (drawEnd - drawStart) * cfg.pxPerSec;
+
+    ctx.drawImage(tile.bitmap, srcX0, 0, srcW, tile.height, dstX0, PAD_T, dstW, plotH);
+  }
+}
+
+async function exportAllZip__FIXV14(){
+  if (!analyzer.inited) return;
+  const secs = detectedSecs__FIXV14.slice();
+  if (secs.length === 0){
+    logLine('全件ZIP: 検出が0件のため中止');
+    return;
+  }
+  if (typeof JSZip === 'undefined'){
+    logLine('全件ZIP: JSZipが読み込めていません（CDN失敗）');
+    return;
+  }
+
+  UI.exportAllZipBtn.disabled = true;
+  UI.scanBtn.disabled = true;
+  UI.scanAbortBtn.disabled = true;
+
+  try{
+    setState('全件ZIP作成中');
+    setScanProgress(0);
+
+    const zip = new JSZip();
+    const imgFolder = zip.folder('images');
+    // const audioFolder = zip.folder('audio'); // optional
+
+    const cfg0 = getConfig();
+    const CANVAS_H = UI.specCanvas.height || 512;
+    const HALF = 5; // 前後5秒
+    const MAX_W = 4096;
+
+    const csvLines = [];
+    // no header (Excel向け: BOM付与は最後に)
+    for (let i=0; i<secs.length; i++){
+      const sec = secs[i];
+      const startSec = Math.max(0, sec - HALF);
+      const endSec = Math.min(analyzer.duration || (sec + HALF), sec + HALF);
+      const dur = Math.max(0.5, endSec - startSec);
+
+      // offscreen pxPerSec scaled to keep width reasonable
+      const pxPerSec = Math.min(cfg0.pxPerSec, Math.max(10, (MAX_W - AXIS_W) / dur));
+      const cfg = { ...cfg0, pxPerSec };
+
+      const w = Math.max(256, Math.floor(AXIS_W + dur * cfg.pxPerSec));
+      const h = Math.max(256, CANVAS_H);
+
+      const oc = (typeof OffscreenCanvas !== 'undefined')
+        ? new OffscreenCanvas(w, h)
+        : (() => { const c=document.createElement('canvas'); c.width=w; c.height=h; return c; })();
+
+      await ensureTilesReadyForRange(cfg, { startSec, endSec });
+      renderRangeToCanvas(oc, startSec, endSec, cfg);
+
+      const imgName = `cut_${fileStampFromSec(sec)}.jpg`;
+      const blob = await (oc.convertToBlob
+        ? oc.convertToBlob({ type:'image/jpeg', quality:0.92 })
+        : new Promise(r => oc.toBlob(r, 'image/jpeg', 0.92)));
+
+      imgFolder.file(imgName, blob);
+
+      const tStr = fmtHMS(sec);
+      csvLines.push(`${tStr},${imgName},,`);
+
+      const pct = ((i+1)/secs.length)*100;
+      setScanProgress(pct);
+      UI.scanPct.textContent = `${pct.toFixed(0)}%`;
+      await new Promise(r => setTimeout(r, 0));
+    }
+
+    const csvText = '\ufeff' + csvLines.join('\n') + '\n';
+    zip.file('detections.csv', csvText);
+
+    // generate zip
+    const zipBlob = await zip.generateAsync({ type:'blob' }, (meta) => {
+      // meta.percent can be used but we already show progress
+    });
+
+    const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+    downloadBlob(zipBlob, `export_all_${stamp}.zip`);
+    setState('完了');
+  } catch(e){
+    setState('エラー');
+    logLine(`全件ZIP失敗: ${e?.message ?? e}`);
+  } finally{
+    UI.exportAllZipBtn.disabled = false;
+    UI.scanBtn.disabled = false;
+    UI.scanAbortBtn.disabled = true;
+    setScanProgress(0);
+  }
+}
+
 }
 
 /** ===================== UI events ===================== */
@@ -779,6 +948,7 @@ function clearAll() {
 
 UI.clearBtn.addEventListener('click', clearAll);
 UI.exportViewBtn.addEventListener('click', exportVisiblePNG);
+UI.exportAllZipBtn.addEventListener('click', exportAllZip__FIXV14);
 
 UI.prepareBtn.addEventListener('click', async () => {
   const file = UI.fileInput.files?.[0];
@@ -915,11 +1085,20 @@ function setScanProgress(pct){
   UI.scanBar.style.width = `${v.toFixed(2)}%`;
 }
 
+const detectedSecs__FIXV14 = [];
+
 function clearDetectList(){
+  detectedSecs__FIXV14.length = 0;
+
   UI.detectList.innerHTML = '';
 }
 
 function addDetectButton(sec){
+  if (!Number.isFinite(sec)) return;
+  // store unique
+  const last = detectedSecs__FIXV14[detectedSecs__FIXV14.length-1];
+  if (last !== sec) detectedSecs__FIXV14.push(sec);
+
   const btn = document.createElement('button');
   btn.textContent = fmtHMS(sec);
   btn.className = 'mono';
@@ -945,7 +1124,7 @@ function wireScanSliders(){
     max = clampNum(max, 0, 24000);
     if (min > max) max = min;
 
-    thr = clampNum(thr, 0, 40);
+    thr = clampNum(thr, 0, 80);
 
     UI.scanMinHz.value = String(min);
     UI.scanMaxHz.value = String(max);
@@ -1152,6 +1331,7 @@ async function scanBandWav(file){
   UI.scanBtn.disabled = true;
   UI.scanAbortBtn.disabled = false;
   clearDetectList();
+  try { if (UI.exportAllZipBtn) UI.exportAllZipBtn.disabled = true; } catch {}
   setScanProgress(0);
 
   scanAbortCtrl = new AbortController();
@@ -1310,6 +1490,7 @@ async function scanBandDecode(file){
   UI.scanBtn.disabled = true;
   UI.scanAbortBtn.disabled = false;
   clearDetectList();
+  try { if (UI.exportAllZipBtn) UI.exportAllZipBtn.disabled = true; } catch {}
   setScanProgress(0);
 
   scanAbortCtrl = new AbortController();
@@ -1497,42 +1678,39 @@ async function scanBandDecode(file){
 
 
 async function scanBand(file){
-  // 仕様:
-  // - WAVなら scanBandWav(file)（バイト計算方式）
-  // - 非WAV(MP3等)は scanBandDecode(file)（decode方式）
-  // - WAV判定でも失敗したら decodeへフォールバック（停止ではない）
+  // IMPORTANT:
+  // - WAV以外(例: MP3/M4A/OGG)は readWavHeader を呼ばず decode方式へ直行
+  // - WAVでもヘッダ/切れ目で失敗したら decode方式へフォールバックして完走を優先
   const name = (file?.name || '').toLowerCase();
   const type = (file?.type || '').toLowerCase();
   const isWav = type.includes('wav') || name.endsWith('.wav') || name.endsWith('.wave');
 
-  if (isWav){
-    try{
-      await scanBandWav(file);
-      return;
-    } catch(e){
-      logLine(`WAV解析失敗→decode方式へ切替: ${e?.message ?? e}`);
-      // フォールバック継続
+  try{
+    if (isWav){
+      try{
+        await scanBandWav(file);
+        return;
+      } catch(e){
+        // WAVとして扱ったが失敗 -> decode方式へ切替
+        logLine(`WAV解析失敗→decode方式へ切替: ${e?.message ?? e}`);
+      }
     }
-  } else {
-    // フォールバック対象（停止ではない）
-    logLine('非WAV→decode方式で解析します');
+    await scanBandDecode(file);
+  } finally {
+    UI.scanBtn.disabled = false;
+    UI.scanAbortBtn.disabled = true;
+    scanAbortCtrl = null;
+    setState('準備完了');
+    setScanProgress(0);
   }
-
-  await scanBandDecode(file);
 }
 
 UI.scanBtn.addEventListener('click', async () => {
   const file = UI.fileInput.files?.[0];
   if (!file) { alert('音声ファイルを選択してください'); return; }
 
-  // ここで初期化（固まり判定を避ける）
-  UI.scanBtn.disabled = true;
-  UI.scanAbortBtn.disabled = false;
-  scanAbortCtrl = new AbortController();
-  setScanProgress(0);
-
   try {
-    await scanBand(file);
+    await scanBandWav(file);
   } catch (e) {
     const msg = e?.message ?? String(e);
     logLine(`スキャン停止: ${msg}`);
@@ -1541,10 +1719,9 @@ UI.scanBtn.addEventListener('click', async () => {
     UI.scanBtn.disabled = false;
     UI.scanAbortBtn.disabled = true;
     scanAbortCtrl = null;
-    // ※進捗は結果表示のまま残す（0%に戻さない）
+    setScanProgress(0);
   }
 });
-
 
 UI.scanAbortBtn.addEventListener('click', () => {
   if (scanAbortCtrl) scanAbortCtrl.abort();
