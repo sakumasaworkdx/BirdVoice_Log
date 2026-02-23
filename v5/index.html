@@ -318,6 +318,8 @@
           <div class="row">
             <button id="scanBtn" class="primary" disabled>全時間スキャン開始</button>
             <button id="scanAbortBtn" class="ghost" disabled>中断</button>
+            <button id="exportAllBtn" class="ghost" disabled>解析結果を全出力（全件一括保存）</button>
+            <span id="exportAllMsg" class="pill mono" style="display:none">出力中...</span>
             <div class="flex-grow"></div>
             <span class="pill mono">進捗: <strong id="scanPct">0%</strong></span>
           </div>
@@ -359,6 +361,7 @@
     <audio id="fullAudio" controls style="width:100%; margin-top:14px; display:none;"></audio>
   </main>
 
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
   <script src="./script.js"></script>
 </body>
 </html>

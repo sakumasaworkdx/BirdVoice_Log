@@ -50,6 +50,10 @@ const UI = {
   noiseEndRange: document.getElementById('noiseEndRange'),
   scanBtn: document.getElementById('scanBtn'),
   scanAbortBtn: document.getElementById('scanAbortBtn'),
+  scanPct:
+  exportAllBtn: document.getElementById('exportAllBtn'),
+  exportAllMsg: document.getElementById('exportAllMsg'),
+
   scanPct: document.getElementById('scanPct'),
   scanBar: document.getElementById('scanBar'),
   detectList: document.getElementById('detectList'),
@@ -716,6 +720,8 @@ async function exportVisiblePNG() {
   if (!analyzer.inited) return;
   setState('PNG作成中');
   UI.exportViewBtn.disabled = true;
+  if (UI.exportAllBtn) UI.exportAllBtn.disabled = true;
+  if (UI.exportAllMsg) UI.exportAllMsg.style.display = 'none';
   try {
     // Render to offscreen at same resolution as current canvas
     const w = UI.specCanvas.width;
@@ -771,6 +777,8 @@ function clearAll() {
   UI.pauseBtn.disabled = true;
   UI.stopBtn.disabled = true;
   UI.exportViewBtn.disabled = true;
+  if (UI.exportAllBtn) UI.exportAllBtn.disabled = true;
+  if (UI.exportAllMsg) UI.exportAllMsg.style.display = 'none';
 
   UI.spacer.style.width = '0px';
   UI.viewport.scrollLeft = 0;
@@ -794,8 +802,12 @@ UI.prepareBtn.addEventListener('click', async () => {
   UI.pauseBtn.disabled = true;
   UI.stopBtn.disabled = true;
   UI.exportViewBtn.disabled = true;
+  if (UI.exportAllBtn) UI.exportAllBtn.disabled = true;
+  if (UI.exportAllMsg) UI.exportAllMsg.style.display = 'none';
   UI.scanBtn.disabled = true;
   UI.scanAbortBtn.disabled = true;
+  if (UI.exportAllBtn) UI.exportAllBtn.disabled = true;
+  if (UI.exportAllMsg) UI.exportAllMsg.style.display = 'none';
 
   abortCtrl = new AbortController();
 
@@ -835,6 +847,7 @@ if (UI.noiseEndRange) UI.noiseEndRange.value = UI.noiseEndSec?.value ?? UI.noise
     UI.stopBtn.disabled = false;
     UI.exportViewBtn.disabled = false;
     UI.scanBtn.disabled = false;
+    if (UI.exportAllBtn) UI.exportAllBtn.disabled = false;
 
     setState('準備完了');
     resizeCanvasToViewport();
@@ -929,11 +942,15 @@ function setScanProgress(pct){
   UI.scanBar.style.width = `${v.toFixed(2)}%`;
 }
 
+let detectTimes = [];
+
 function clearDetectList(){
   UI.detectList.innerHTML = '';
+  detectTimes = [];
 }
 
 function addDetectButton(sec){
+  detectTimes.push(sec);
   const btn = document.createElement('button');
   btn.textContent = fmtHMS(sec);
   btn.className = 'mono';
@@ -1691,6 +1708,7 @@ async function scanBand(file){
     await scanBandDecode(file);
   } finally {
     UI.scanBtn.disabled = false;
+    if (UI.exportAllBtn) UI.exportAllBtn.disabled = false;
     UI.scanAbortBtn.disabled = true;
     scanAbortCtrl = null;
     setState('準備完了');
@@ -1710,6 +1728,7 @@ UI.scanBtn.addEventListener('click', async () => {
     setState('準備完了');
   } finally {
     UI.scanBtn.disabled = false;
+    if (UI.exportAllBtn) UI.exportAllBtn.disabled = false;
     UI.scanAbortBtn.disabled = true;
     scanAbortCtrl = null;
     setScanProgress(0);
@@ -1718,6 +1737,315 @@ UI.scanBtn.addEventListener('click', async () => {
 
 UI.scanAbortBtn.addEventListener('click', () => {
   if (scanAbortCtrl) scanAbortCtrl.abort();
+});
+
+
+/** ===================== Export ALL detections (CSV + images + audio) ===================== */
+function setExportAllMsg(text, show=true){
+  if (!UI.exportAllMsg) return;
+  UI.exportAllMsg.textContent = text;
+  UI.exportAllMsg.style.display = show ? '' : 'none';
+}
+
+function secToCutStamp(sec){
+  const s = Math.max(0, Math.floor(sec));
+  const hh = Math.floor(s/3600);
+  const mm = Math.floor((s%3600)/60);
+  const ss = s%60;
+  const pad2 = (v) => String(v).padStart(2,'0');
+  return `${pad2(hh)}-${pad2(mm)}-${pad2(ss)}`;
+}
+
+async function getOrGenerateTileDirect(tileIndex, cfg){
+  const key = makeTileKey(tileIndex, cfg);
+  const hit = tileCache.get(key);
+  if (hit) { hit.lastUsed = nowMs(); return hit; }
+  try{
+    const tile = await generateTileBitmap(tileIndex, cfg, null);
+    tileCache.set(key, tile);
+    tile.lastUsed = nowMs();
+    lruPrune(cfg.cacheTiles);
+    return tile;
+  } catch(e){
+    logLine(`tile#${tileIndex} 生成失敗: ${e?.message ?? e}`);
+    return null;
+  }
+}
+
+async function renderRangeToCanvas(targetCanvas, cfg, startSec, endSec){
+  if (!analyzer.inited) return;
+  const ctx = targetCanvas.getContext('2d', { alpha:false, willReadFrequently:false });
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,targetCanvas.width, targetCanvas.height);
+
+  const plotH = Math.max(1, targetCanvas.height - PAD_T - PAD_B);
+
+  // axis + grids
+  // NOTE: drawAxis/drawTimeTopGrid use UI.specCanvas sizes; temporarily mirror
+  const prevW = UI.specCanvas.width, prevH = UI.specCanvas.height;
+  UI.specCanvas.width = targetCanvas.width;
+  UI.specCanvas.height = targetCanvas.height;
+  try{
+    drawAxis(ctx, cfg, plotH);
+    drawTimeTopGrid(ctx, cfg, startSec, endSec);
+    drawBandHighlight(ctx, cfg, plotH);
+
+    // ensure tiles ready (strict await)
+    const startIdx = Math.floor(startSec / cfg.tileSec);
+    const endIdx = Math.floor(endSec / cfg.tileSec);
+    for (let ti=startIdx; ti<=endIdx; ti++){
+      const tile = await getOrGenerateTileDirect(ti, cfg);
+      if (!tile) continue;
+      await sleep(0);
+    }
+
+    const plotX0 = AXIS_W;
+    for (let ti = startIdx; ti <= endIdx; ti++){
+      const key = makeTileKey(ti, cfg);
+      const tile = tileCache.get(key);
+      if (!tile) continue;
+      tile.lastUsed = nowMs();
+
+      const tileStart = ti * cfg.tileSec;
+      const tileEnd = tileStart + cfg.tileSec;
+      const drawStart = Math.max(startSec, tileStart);
+      const drawEnd = Math.min(endSec, tileEnd);
+      if (drawEnd <= drawStart) continue;
+
+      const srcX0 = (drawStart - tileStart) * cfg.fps;
+      const srcX1 = (drawEnd - tileStart) * cfg.fps;
+      const srcW = Math.max(1, srcX1 - srcX0);
+
+      const dstX0 = plotX0 + (drawStart - startSec) * cfg.pxPerSec;
+      const dstW = (drawEnd - drawStart) * cfg.pxPerSec;
+
+      ctx.drawImage(
+        tile.bitmap,
+        srcX0, 0, srcW, tile.height,
+        dstX0, PAD_T, dstW, plotH
+      );
+    }
+  } finally {
+    UI.specCanvas.width = prevW;
+    UI.specCanvas.height = prevH;
+  }
+}
+
+async function renderDetectImageJpg(centerSec, preSec=5, postSec=5){
+  const cfgBase = getConfig();
+  const scanCfg = getCurrentScanSettings();
+  // Focus to scan band for export images
+  const cfg = {
+    ...cfgBase,
+    minHz: Math.min(scanCfg.minHz, scanCfg.maxHz),
+    maxHz: Math.max(scanCfg.minHz, scanCfg.maxHz),
+  };
+
+  const startSec = clamp(centerSec - preSec, 0, analyzer.duration);
+  const endSec = clamp(centerSec + postSec, 0, analyzer.duration);
+  const w = UI.specCanvas.width || 1200;
+  const h = UI.specCanvas.height || 520;
+
+  const oc = (typeof OffscreenCanvas !== 'undefined')
+    ? new OffscreenCanvas(w, h)
+    : (() => { const c=document.createElement('canvas'); c.width=w; c.height=h; return c; })();
+
+  await renderRangeToCanvas(oc, cfg, startSec, endSec);
+
+  const blob = await (oc.convertToBlob
+    ? oc.convertToBlob({ type:'image/jpeg', quality:0.92 })
+    : new Promise(r => oc.toBlob(r, 'image/jpeg', 0.92))
+  );
+  return blob;
+}
+
+// WAV direct-cut helper (no decode)
+function buildWavHeaderBytes(sampleRate, numChannels, bitsPerSample, dataBytes){
+  const blockAlign = numChannels * (bitsPerSample/8);
+  const byteRate = sampleRate * blockAlign;
+  const buffer = new ArrayBuffer(44);
+  const dv = new DataView(buffer);
+  const writeStr = (off, s) => { for (let i=0;i<s.length;i++) dv.setUint8(off+i, s.charCodeAt(i)); };
+  writeStr(0,'RIFF');
+  dv.setUint32(4, 36 + dataBytes, true);
+  writeStr(8,'WAVE');
+  writeStr(12,'fmt ');
+  dv.setUint32(16, 16, true);         // PCM fmt chunk size
+  dv.setUint16(20, 1, true);          // audio format 1=PCM
+  dv.setUint16(22, numChannels, true);
+  dv.setUint32(24, sampleRate, true);
+  dv.setUint32(28, byteRate, true);
+  dv.setUint16(32, blockAlign, true);
+  dv.setUint16(34, bitsPerSample, true);
+  writeStr(36,'data');
+  dv.setUint32(40, dataBytes, true);
+  return new Uint8Array(buffer);
+}
+
+async function cutWavClipBlob(file, wavInfo, startSec, endSec){
+  const s = clamp(startSec, 0, analyzer.duration);
+  const e = clamp(endSec, 0, analyzer.duration);
+  if (e <= s) return null;
+
+  const bytesPerFrame = wavInfo.numChannels * (wavInfo.bitsPerSample/8);
+  const startFrame = Math.max(0, Math.floor(s * wavInfo.sampleRate));
+  const endFrame = Math.max(startFrame+1, Math.floor(e * wavInfo.sampleRate));
+  const startByte = wavInfo.dataOffset + startFrame * bytesPerFrame;
+  const endByte = Math.min(file.size, wavInfo.dataOffset + endFrame * bytesPerFrame);
+
+  const pcmBuf = await file.slice(startByte, endByte).arrayBuffer();
+  const pcmU8 = new Uint8Array(pcmBuf);
+
+  const header = buildWavHeaderBytes(wavInfo.sampleRate, wavInfo.numChannels, wavInfo.bitsPerSample, pcmU8.byteLength);
+  const out = new Uint8Array(header.byteLength + pcmU8.byteLength);
+  out.set(header, 0);
+  out.set(pcmU8, header.byteLength);
+  return new Blob([out], { type:'audio/wav' });
+}
+
+async function decodeToAudioBufferIfSmall(file, maxBytes=300*1024*1024){
+  if (file.size > maxBytes) return null;
+  try{
+    const ab = await file.arrayBuffer();
+    const ctx = analyzer.audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    return await ctx.decodeAudioData(ab.slice(0));
+  } catch(e){
+    logLine(`decode失敗(全体): ${e?.message ?? e}`);
+    return null;
+  }
+}
+
+function audioBufferToWavBlob(buffer, startSec, endSec){
+  const sr = buffer.sampleRate;
+  const ch = buffer.numberOfChannels;
+  const s = Math.max(0, Math.floor(startSec * sr));
+  const e = Math.min(buffer.length, Math.ceil(endSec * sr));
+  const frames = Math.max(1, e - s);
+
+  // 16-bit PCM
+  const bitsPerSample = 16;
+  const bytesPerSample = 2;
+  const bytesPerFrame = ch * bytesPerSample;
+  const dataBytes = frames * bytesPerFrame;
+
+  const header = buildWavHeaderBytes(sr, ch, bitsPerSample, dataBytes);
+  const out = new Uint8Array(44 + dataBytes);
+  out.set(header, 0);
+
+  // interleave
+  let offset = 44;
+  for (let i=0;i<frames;i++){
+    for (let c=0;c<ch;c++){
+      const v = buffer.getChannelData(c)[s+i] || 0;
+      const clamped = Math.max(-1, Math.min(1, v));
+      const int16 = (clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF) | 0;
+      out[offset++] = int16 & 0xFF;
+      out[offset++] = (int16 >> 8) & 0xFF;
+    }
+  }
+  return new Blob([out], { type:'audio/wav' });
+}
+
+UI.exportAllBtn?.addEventListener('click', async () => {
+  const file = UI.fileInput.files?.[0];
+  if (!file) { alert('音声ファイルを選択してください'); return; }
+  if (!analyzer.inited) { alert('先に「読み込み/準備」をしてください'); return; }
+  if (!Array.isArray(detectTimes) || detectTimes.length === 0) { alert('検出リストが空です'); return; }
+  if (typeof JSZip === 'undefined') { alert('JSZip が読み込めていません'); return; }
+
+  UI.exportAllBtn.disabled = true;
+  UI.scanBtn.disabled = true;
+  UI.scanAbortBtn.disabled = true;
+  UI.exportViewBtn.disabled = true;
+
+  // stop any playback
+  try { UI.fullAudio.pause(); } catch {}
+  stopPlayheadLoop();
+
+  const zip = new JSZip();
+  const csvRows = [];
+  csvRows.push('time,image,,,'); // header-ish (C/D blank)
+
+  setExportAllMsg(`全件出力開始... (0/${detectTimes.length})`, true);
+  setState('全件出力中');
+
+  // Determine WAV ability
+  let wavInfo = null;
+  let wholeBuf = null;
+  try { wavInfo = await readWavHeader(file); } catch { wavInfo = null; }
+  if (!wavInfo){
+    // try decode whole file if not too big (for non-WAV)
+    wholeBuf = await decodeToAudioBufferIfSmall(file);
+    if (!wholeBuf) logLine('音声切り出し: WAV以外で巨大ファイルのためスキップ（画像+CSVのみ）');
+  }
+
+  const preSec = 5, postSec = 5;
+
+  try{
+    // stable order
+    const times = detectTimes.slice().filter(v => Number.isFinite(v)).sort((a,b)=>a-b);
+
+    for (let i=0;i<times.length;i++){
+      const tSec = times[i];
+      const stamp = secToCutStamp(tSec);
+      const imgName = `cut_${stamp}.jpg`;
+      const wavName = `cut_${stamp}.wav`;
+
+      setExportAllMsg(`画像生成中... (${i+1}/${times.length})`, true);
+
+      // --- image ---
+      try{
+        const imgBlob = await renderDetectImageJpg(tSec, preSec, postSec);
+        if (imgBlob) zip.file(imgName, imgBlob);
+      } catch(e){
+        logLine(`画像生成失敗(${imgName}): ${e?.message ?? e}`);
+      }
+
+      // --- audio ---
+      let audioAdded = false;
+      try{
+        if (wavInfo){
+          const wavBlob = await cutWavClipBlob(file, wavInfo, tSec - preSec, tSec + postSec);
+          if (wavBlob) { zip.file(wavName, wavBlob); audioAdded = true; }
+        } else if (wholeBuf){
+          const wavBlob = audioBufferToWavBlob(wholeBuf, tSec - preSec, tSec + postSec);
+          zip.file(wavName, wavBlob); audioAdded = true;
+        }
+      } catch(e){
+        logLine(`音声切り出し失敗(${wavName}): ${e?.message ?? e}`);
+      }
+
+      // CSV
+      csvRows.push(`${secToHMS(tSec)},${imgName},,`);
+
+      // yield to UI
+      await sleep(0);
+    }
+
+    // CSV add
+    const csv = csvRows.join('\r\n');
+    zip.file('data.csv', csv);
+
+    setExportAllMsg('ZIP生成中...', true);
+    const blob = await zip.generateAsync({ type:'blob', compression:'DEFLATE', compressionOptions:{ level: 6 } }, (meta) => {
+      if (meta?.percent != null){
+        setExportAllMsg(`ZIP生成中... ${meta.percent.toFixed(1)}%`, true);
+      }
+    });
+
+    const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+    downloadBlob(blob, `birdvoice_export_${stamp}.zip`);
+    logLine(`全件出力完了: ${times.length}件`);
+    setState('準備完了');
+  } catch(e){
+    logLine(`全件出力失敗: ${e?.message ?? e}`);
+    setState('エラー');
+  } finally {
+    setExportAllMsg('', false);
+    UI.exportAllBtn.disabled = false;
+    UI.scanBtn.disabled = false;
+    UI.exportViewBtn.disabled = false;
+  }
 });
 
 wireScanSliders();
