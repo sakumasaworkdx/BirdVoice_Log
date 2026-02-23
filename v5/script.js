@@ -1,13 +1,10 @@
 /* eslint-disable no-console */
-\1
+'use strict';
 
-/* BUILD_LABEL__FIXV14 */
-const BUILD_LABEL = 'BirdVoice_Log v5 (fix v14) 2026-02-23';
-try {
-  console.log('[boot]', BUILD_LABEL);
-  const bl = document.getElementById('buildLabel');
-  if (bl) bl.textContent = BUILD_LABEL;
-} catch(_e) {}
+/* BUILD_LABEL__FIXV15 */
+const BUILD_LABEL = "BirdVoice_Log v5 (fix v15) 2026-02-23";
+console.log('[boot]', BUILD_LABEL);
+try{ const bl=document.getElementById('buildLabel'); if (bl) bl.textContent = BUILD_LABEL; }catch(_e){}
 
 /**
  * v2 追加
@@ -45,7 +42,6 @@ const UI = {
   scanMinHzVal: document.getElementById('scanMinHzVal'),
   scanMaxHzVal: document.getElementById('scanMaxHzVal'),
   scanThresholdVal: document.getElementById('scanThresholdVal'),
-  scanSegSec: document.getElementById('scanSegSec'),
   presetNight: document.getElementById('presetNight'),
   presetOwl: document.getElementById('presetOwl'),
   presetTora: document.getElementById('presetTora'),
@@ -62,7 +58,7 @@ const UI = {
   pauseBtn: document.getElementById('pauseBtn'),
   stopBtn: document.getElementById('stopBtn'),
   exportViewBtn: document.getElementById('exportViewBtn'),
-  exportAllZipBtn: document.getElementById('exportAllZipBtn'),
+  exportAllBtn: document.getElementById('exportAllBtn'),
   clearBtn: document.getElementById('clearBtn'),
 
   barFill: document.getElementById('barFill'),
@@ -742,49 +738,23 @@ async function exportVisiblePNG() {
   } finally {
     UI.exportViewBtn.disabled = false;
   }
-function pad2(n){ return String(n).padStart(2,'0'); }
-function fileStampFromSec(sec){
-  const t = Math.max(0, sec|0);
-  const hh = pad2(Math.floor(t/3600));
-  const mm = pad2(Math.floor((t%3600)/60));
-  const ss = pad2(t%60);
-  return `${hh}-${mm}-${ss}`;
 }
 
-async function ensureTilesReadyForRange(cfg, range){
-  const startIdx = Math.floor(range.startSec / cfg.tileSec);
-  const endIdx = Math.floor(range.endSec / cfg.tileSec);
-  for (let ti = startIdx; ti <= endIdx; ti++){
-    const key = makeTileKey(ti, cfg);
-    const hit = tileCache.get(key);
-    if (hit) { hit.lastUsed = nowMs(); continue; }
-    // generate synchronously for export
-    const tile = await generateTileBitmap(ti, cfg, null);
-    tileCache.set(key, tile);
-    tile.lastUsed = nowMs();
-    // yield to avoid freezing
-    await new Promise(r => setTimeout(r, 0));
-  }
-}
 
-function renderRangeToCanvas(targetCanvas, startSec, endSec, cfg){
-  if (!analyzer.inited) return;
-  const ctx = targetCanvas.getContext('2d', { alpha:false, willReadFrequently:false });
+async function renderTimeRangeToCanvas(targetCanvas, range, cfg){
+  if (!analyzer.inited) throw new Error('未準備');
+  const ctx = targetCanvas.getContext('2d', { alpha:false });
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0,0,targetCanvas.width, targetCanvas.height);
 
   const plotH = Math.max(1, targetCanvas.height - PAD_T - PAD_B);
-  const range = { startSec, endSec };
-
   // axis + grids
   drawAxis(ctx, cfg, plotH);
   drawTimeTopGrid(ctx, cfg, range.startSec, range.endSec);
-
-  // optional highlight
   drawBandHighlight(ctx, cfg, plotH);
 
-  // ensure tiles ready
-  // (caller should await ensureTilesReadyForRange)
+  // wait tiles
+  await ensureTilesForRangeAsync(cfg, range);
 
   const startIdx = Math.floor(range.startSec / cfg.tileSec);
   const endIdx = Math.floor(range.endSec / cfg.tileSec);
@@ -798,110 +768,112 @@ function renderRangeToCanvas(targetCanvas, startSec, endSec, cfg){
 
     const tileStart = ti * cfg.tileSec;
     const tileEnd = tileStart + cfg.tileSec;
-    const drawStart = Math.max(range.startSec, tileStart);
-    const drawEnd = Math.min(range.endSec, tileEnd);
+    const drawStart = Math.max(tileStart, range.startSec);
+    const drawEnd = Math.min(tileEnd, range.endSec);
     if (drawEnd <= drawStart) continue;
 
-    const srcX0 = (drawStart - tileStart) * cfg.fps;
-    const srcX1 = (drawEnd - tileStart) * cfg.fps;
+    const srcX0 = ((drawStart - tileStart) / cfg.tileSec) * tile.w;
+    const srcX1 = ((drawEnd - tileStart) / cfg.tileSec) * tile.w;
     const srcW = Math.max(1, srcX1 - srcX0);
 
     const dstX0 = plotX0 + (drawStart - range.startSec) * cfg.pxPerSec;
-    const dstW = (drawEnd - drawStart) * cfg.pxPerSec;
+    const dstX1 = plotX0 + (drawEnd - range.startSec) * cfg.pxPerSec;
+    const dstW = Math.max(1, dstX1 - dstX0);
 
-    ctx.drawImage(tile.bitmap, srcX0, 0, srcW, tile.height, dstX0, PAD_T, dstW, plotH);
+    ctx.drawImage(tile.bitmap, srcX0, 0, srcW, tile.h, dstX0, PAD_T, dstW, plotH);
   }
 }
 
-async function exportAllZip__FIXV14(){
-  if (!analyzer.inited) return;
-  const secs = detectedSecs__FIXV14.slice();
-  if (secs.length === 0){
-    logLine('全件ZIP: 検出が0件のため中止');
-    return;
+async function ensureTilesForRangeAsync(cfg, range){
+  const startIdx = Math.floor(range.startSec / cfg.tileSec);
+  const endIdx = Math.floor(range.endSec / cfg.tileSec);
+  const needKeys = [];
+  for (let ti=startIdx; ti<=endIdx; ti++){
+    needKeys.push(makeTileKey(ti, cfg));
   }
-  if (typeof JSZip === 'undefined'){
-    logLine('全件ZIP: JSZipが読み込めていません（CDN失敗）');
-    return;
+  const t0 = nowMs();
+  while(true){
+    if (abortCtrl?.signal?.aborted) throw new Error('中断');
+    // schedule generation
+    ensureTilesForRange(cfg, range);
+    const missing = needKeys.filter(k => !tileCache.has(k));
+    if (missing.length === 0) return;
+    if (nowMs() - t0 > 120000) throw new Error('タイル生成タイムアウト');
+    await sleep(60);
   }
+}
 
-  UI.exportAllZipBtn.disabled = true;
-  UI.scanBtn.disabled = true;
-  UI.scanAbortBtn.disabled = true;
+function formatCutName(sec){
+  const s = fmtHMS(sec).replace(/:/g,'-');
+  return `cut_${s}.jpg`;
+}
 
-  try{
-    setState('全件ZIP作成中');
-    setScanProgress(0);
+function makeDetectionsCSV(rows){
+  // A:検出時刻, B:画像名, C/D空欄（ヘッダ無し）
+  return rows.map(r => `${r.time},${r.img},,`).join('\n') + '\n';
+}
 
-    const zip = new JSZip();
-    const imgFolder = zip.folder('images');
-    // const audioFolder = zip.folder('audio'); // optional
+async function exportAllDetectionsZIP(){
+  if (!analyzer.inited) { alert('先に 読み込み/準備'); return; }
+  if (!window.JSZip) { alert('JSZipが読み込めていません（CDN失敗）'); return; }
+  if (!scanDetections.length) { alert('検出がありません'); return; }
 
-    const cfg0 = getConfig();
-    const CANVAS_H = UI.specCanvas.height || 512;
-    const HALF = 5; // 前後5秒
-    const MAX_W = 4096;
+  const cfg = getConfig();
+  const winSec = 10.0; // 前後5秒
+  const half = winSec/2;
 
-    const csvLines = [];
-    // no header (Excel向け: BOM付与は最後に)
-    for (let i=0; i<secs.length; i++){
-      const sec = secs[i];
-      const startSec = Math.max(0, sec - HALF);
-      const endSec = Math.min(analyzer.duration || (sec + HALF), sec + HALF);
-      const dur = Math.max(0.5, endSec - startSec);
+  UI.exportAllBtn.disabled = true;
+  setState('全件ZIP作成中');
+  logLine(`全件ZIP: ${scanDetections.length}件`);
 
-      // offscreen pxPerSec scaled to keep width reasonable
-      const pxPerSec = Math.min(cfg0.pxPerSec, Math.max(10, (MAX_W - AXIS_W) / dur));
-      const cfg = { ...cfg0, pxPerSec };
+  const zip = new JSZip();
+  const imgFolder = zip.folder('images');
+  const rows = [];
 
-      const w = Math.max(256, Math.floor(AXIS_W + dur * cfg.pxPerSec));
-      const h = Math.max(256, CANVAS_H);
+  // offscreen canvas (size per item)
+  const H = UI.specCanvas.height;
+  // width depends on cfg.pxPerSec to keep same scale as UI
+  const plotW = Math.max(1, Math.round(winSec * cfg.pxPerSec));
+  const W = AXIS_W + plotW;
 
-      const oc = (typeof OffscreenCanvas !== 'undefined')
-        ? new OffscreenCanvas(w, h)
-        : (() => { const c=document.createElement('canvas'); c.width=w; c.height=h; return c; })();
+  for (let i=0;i<scanDetections.length;i++){
+    if (abortCtrl?.signal?.aborted) break;
+    const sec = scanDetections[i].sec;
+    const startSec = Math.max(0, sec - half);
+    const endSec = Math.min(analyzer.durationSec || (sec+half), sec + half);
+    const range = { startSec, endSec };
 
-      await ensureTilesReadyForRange(cfg, { startSec, endSec });
-      renderRangeToCanvas(oc, startSec, endSec, cfg);
+    // create offscreen
+    const oc = (typeof OffscreenCanvas !== 'undefined')
+      ? new OffscreenCanvas(W, H)
+      : (() => { const c=document.createElement('canvas'); c.width=W; c.height=H; return c; })();
 
-      const imgName = `cut_${fileStampFromSec(sec)}.jpg`;
-      const blob = await (oc.convertToBlob
-        ? oc.convertToBlob({ type:'image/jpeg', quality:0.92 })
-        : new Promise(r => oc.toBlob(r, 'image/jpeg', 0.92)));
-
-      imgFolder.file(imgName, blob);
-
-      const tStr = fmtHMS(sec);
-      csvLines.push(`${tStr},${imgName},,`);
-
-      const pct = ((i+1)/secs.length)*100;
-      setScanProgress(pct);
-      UI.scanPct.textContent = `${pct.toFixed(0)}%`;
-      await new Promise(r => setTimeout(r, 0));
+    try{
+      await renderTimeRangeToCanvas(oc, range, cfg);
+      const blob = await (oc.convertToBlob ? oc.convertToBlob({ type:'image/jpeg', quality:0.92 }) : new Promise(r => oc.toBlob(r, 'image/jpeg', 0.92)));
+      const name = formatCutName(sec);
+      imgFolder.file(name, blob);
+      rows.push({ time: fmtHMS(sec), img: name });
+    } catch(e){
+      logLine(`画像失敗@${fmtHMS(sec)}: ${e?.message ?? e}`);
     }
 
-    const csvText = '\ufeff' + csvLines.join('\n') + '\n';
-    zip.file('detections.csv', csvText);
-
-    // generate zip
-    const zipBlob = await zip.generateAsync({ type:'blob' }, (meta) => {
-      // meta.percent can be used but we already show progress
-    });
-
-    const stamp = new Date().toISOString().replace(/[:.]/g,'-');
-    downloadBlob(zipBlob, `export_all_${stamp}.zip`);
-    setState('完了');
-  } catch(e){
-    setState('エラー');
-    logLine(`全件ZIP失敗: ${e?.message ?? e}`);
-  } finally{
-    UI.exportAllZipBtn.disabled = false;
-    UI.scanBtn.disabled = false;
-    UI.scanAbortBtn.disabled = true;
-    setScanProgress(0);
+    // progress
+    const pct = ((i+1)/scanDetections.length)*100;
+    setScanProgress(pct);
+    await sleep(0);
   }
-}
 
+  zip.file('detections.csv', makeDetectionsCSV(rows));
+
+  const out = await zip.generateAsync({ type:'blob', compression:'DEFLATE', compressionOptions:{ level:6 } }, (meta) => {
+    // meta.percent is zip build progress; don't overwrite scanPct too aggressively
+  });
+
+  const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+  downloadBlob(out, `export_all_${stamp}.zip`);
+  setState('完了');
+  UI.exportAllBtn.disabled = false;
 }
 
 /** ===================== UI events ===================== */
@@ -948,7 +920,7 @@ function clearAll() {
 
 UI.clearBtn.addEventListener('click', clearAll);
 UI.exportViewBtn.addEventListener('click', exportVisiblePNG);
-UI.exportAllZipBtn.addEventListener('click', exportAllZip__FIXV14);
+if (UI.exportAllBtn) UI.exportAllBtn.addEventListener('click', exportAllDetectionsZIP);
 
 UI.prepareBtn.addEventListener('click', async () => {
   const file = UI.fileInput.files?.[0];
@@ -1085,20 +1057,17 @@ function setScanProgress(pct){
   UI.scanBar.style.width = `${v.toFixed(2)}%`;
 }
 
-const detectedSecs__FIXV14 = [];
+const scanDetections = []; // [{sec:number}]
 
 function clearDetectList(){
-  detectedSecs__FIXV14.length = 0;
-
+  scanDetections.length = 0;
   UI.detectList.innerHTML = '';
+  if (UI.exportAllBtn) UI.exportAllBtn.disabled = true;
 }
 
 function addDetectButton(sec){
-  if (!Number.isFinite(sec)) return;
-  // store unique
-  const last = detectedSecs__FIXV14[detectedSecs__FIXV14.length-1];
-  if (last !== sec) detectedSecs__FIXV14.push(sec);
-
+  scanDetections.push({ sec });
+  if (UI.exportAllBtn) UI.exportAllBtn.disabled = false;
   const btn = document.createElement('button');
   btn.textContent = fmtHMS(sec);
   btn.className = 'mono';
@@ -1161,24 +1130,16 @@ function wireScanSliders(){
     syncAll();
   });
 
-  // presets (min/max Hz, segSec, thrDelta dB)
-  const setPreset = (min, max, segSec, thrDelta) => {
+  // presets (delta dB)
+  const setPreset = (min, max, thrDelta) => {
     UI.scanMinHz.value = String(min);
     UI.scanMaxHz.value = String(max);
     UI.scanThreshold.value = String(thrDelta);
-    if (UI.scanSegSec) UI.scanSegSec.value = String(segSec);
     syncAll();
   };
-  UI.presetNight?.addEventListener('click', () => setPreset(800, 4000, 2.0, 12));
-  UI.presetOwl?.addEventListener('click', () => setPreset(400, 1200, 3.0, 10));
-  UI.presetTora?.addEventListener('click', () => setPreset(2000, 2800, 1.0, 15));
-
-  // seg sec clamp
-  UI.scanSegSec?.addEventListener('input', () => {
-    const v = parseFloat(UI.scanSegSec.value);
-    if (!Number.isFinite(v)) return;
-    UI.scanSegSec.value = String(clamp(v, 0.5, 10.0));
-  });
+  UI.presetNight?.addEventListener('click', () => setPreset(800, 4000, 10));
+  UI.presetOwl?.addEventListener('click', () => setPreset(400, 1200, 12));
+  UI.presetTora?.addEventListener('click', () => setPreset(2000, 2800, 15));
 
   syncAll();
 }
@@ -1317,21 +1278,13 @@ function decodePcmMono(buffer, header){
   return mono;
 }
 
-
-function getScanSegSec(){
-  const v = parseFloat(UI.scanSegSec?.value ?? '2.0');
-  const seg = Number.isFinite(v) ? v : 2.0;
-  return clamp(seg, 0.5, 10.0);
-}
-
 async function scanBandWav(file){
-  const SEG_SEC = getScanSegSec();
+  const SEG_SEC = 5;
 
   setState('スキャン中');
   UI.scanBtn.disabled = true;
   UI.scanAbortBtn.disabled = false;
   clearDetectList();
-  try { if (UI.exportAllZipBtn) UI.exportAllZipBtn.disabled = true; } catch {}
   setScanProgress(0);
 
   scanAbortCtrl = new AbortController();
@@ -1339,7 +1292,7 @@ async function scanBandWav(file){
 
   const header = await readWavHeader(file);
   const bytesPerSec = header.sampleRate * header.blockAlign;
-  const segBytes = Math.max(1, Math.floor(bytesPerSec * SEG_SEC));
+  const segBytes = Math.floor(bytesPerSec * SEG_SEC);
   const totalSeg = Math.ceil(header.dataSize / segBytes);
 
   const FFT_N = 2048;
@@ -1354,14 +1307,11 @@ async function scanBandWav(file){
   const hi = Math.max(minHz, maxHz);
 
   const binHz = header.sampleRate / FFT_N;
-  const minBin = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
-  const maxBin = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
-  const bins = Math.max(1, (maxBin - minBin + 1));
+  const minBin = clamp(Math.floor(lo / binHz), 0, FFT_N/2);
+  const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
 
-  // ---- noise learn (per-bin baseline dB) ----
-  let baselineDb = new Float32Array(bins);
-  baselineDb.fill(-120);
-
+  // ---- noise learn (seconds range) ----
+  let noiseFloorDb = -120;
   try{
     const ns = parseFloat(UI.noiseStartSec?.value ?? '5');
     const ne = parseFloat(UI.noiseEndSec?.value ?? '7');
@@ -1378,6 +1328,7 @@ async function scanBandWav(file){
     const monoN = decodePcmMono(nab, header);
 
     const hopN = FFT_N >> 1;
+    const bins = (maxBin - minBin + 1);
     const acc = new Float64Array(bins);
     let framesN = 0;
 
@@ -1394,27 +1345,23 @@ async function scanBandWav(file){
       framesN++;
     }
 
+    let noiseFloorPow = 0;
     if (framesN > 0){
       for (let k=0;k<bins;k++){
-        const meanPow = acc[k] / framesN;
-        baselineDb[k] = 10 * Math.log10(meanPow + 1e-12);
+        const mean = acc[k] / framesN;
+        if (mean > noiseFloorPow) noiseFloorPow = mean;
       }
-      // display: use median-ish (sorted mid) for logging
-      const tmpArr = Array.from(baselineDb);
-      tmpArr.sort((a,b)=>a-b);
-      const mid = tmpArr[Math.floor(tmpArr.length*0.5)];
-      logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / baseline≈${mid.toFixed(1)} dB (per-bin)`);
-    } else {
-      logLine('ノイズ学習: フレーム不足（baseline=-120dB扱い）');
+      noiseFloorDb = 10 * Math.log10(noiseFloorPow + 1e-12);
     }
+    logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / floor≈${noiseFloorDb.toFixed(1)} dB`);
   } catch(e){
     logLine(`ノイズ学習失敗（継続）: ${e?.message ?? e}`);
-    baselineDb.fill(-120);
+    noiseFloorDb = -120;
   }
 
-  logLine(`スキャン開始: WAV ${header.sampleRate}Hz ch=${header.numChannels} bits=${header.bitsPerSample} / SEG=${SEG_SEC.toFixed(2)}s / FFT=${FFT_N}`);
+  logLine(`スキャン開始: WAV ${header.sampleRate}Hz ch=${header.numChannels} bits=${header.bitsPerSample} / SEG=5s / FFT=${FFT_N}`);
   logLine(`帯域: ${lo}..${hi} Hz / 検出感度(差分): +${thrDeltaDb} dB`);
-  logLine(`判定: SEG内で1フレームでも max( frameDb(bin) - baselineDb(bin) ) > +thr`);
+  logLine(`判定: 5秒内で1フレームでも (frameDb - noiseFloorDb) > +thr`);
 
   let lastDetectedBucket = -9999;
 
@@ -1426,19 +1373,8 @@ async function scanBandWav(file){
     const sliceStart = header.dataOffset + startByte;
     const sliceEnd = header.dataOffset + endByte;
 
-    const secAt = (startByte / bytesPerSec);
-
-    let mono;
-    try{
-      const ab = await file.slice(sliceStart, sliceEnd).arrayBuffer();
-      mono = decodePcmMono(ab, header);
-    } catch(e){
-      // decode error -> skip
-      logLine(`seg#${seg} decode失敗（スキップ）: ${e?.message ?? e}`);
-      setScanProgress((seg+1)/totalSeg*100);
-      await sleep(0);
-      continue;
-    }
+    const ab = await file.slice(sliceStart, sliceEnd).arrayBuffer();
+    const mono = decodePcmMono(ab, header);
 
     const hop = FFT_N >> 1;
     let detected = false;
@@ -1450,47 +1386,43 @@ async function scanBandWav(file){
       }
       fftInPlace(re, im, plan);
 
-      let maxDiffDb = -9999;
+      let frameMaxPow = 0;
       for (let b=minBin; b<=maxBin; b++){
         const rr = re[b], ii = im[b];
-        const pow = rr*rr + ii*ii;
-        const frameDb = 10 * Math.log10(pow + 1e-12);
-        const diff = frameDb - baselineDb[b-minBin];
-        if (diff > maxDiffDb) maxDiffDb = diff;
+        const p = rr*rr + ii*ii;
+        if (p > frameMaxPow) frameMaxPow = p;
       }
-
-      if (maxDiffDb >= thrDeltaDb) { detected = true; break; }
-      if (sig.aborted) throw new Error('スキャン中断');
+      const frameDb = 10 * Math.log10(frameMaxPow + 1e-12);
+      if ((frameDb - noiseFloorDb) > thrDeltaDb){
+        detected = true;
+        break;
+      }
+      if (sig.aborted) break;
     }
+
+    setScanProgress(((seg+1)/totalSeg)*100);
 
     if (detected){
-      const bucket = Math.floor(secAt / SEG_SEC);
+      const bucket = seg;
       if (bucket !== lastDetectedBucket){
-        addDetectButton(secAt);
         lastDetectedBucket = bucket;
+        addDetectButton(bucket * SEG_SEC);
       }
     }
 
-    setScanProgress((seg+1)/totalSeg*100);
-    if (seg % 8 === 0) await sleep(0);
+    await sleep(0);
   }
-
-  logLine('スキャン完了');
-  setState('準備完了');
-  UI.scanAbortBtn.disabled = true;
 }
 
-
 async function scanBandDecode(file){
-  // MP3/AAC/OGG等: slice → decodeAudioData → FFT判定（境界デコード失敗はスキップして継続）
-  const SEG_SEC = getScanSegSec();
+  // MP3/AAC/OGG等: slice → decodeAudioData → FFT判定
+  const SEG_SEC = 5;
   const OVERLAP_SEC = 0.25;
 
   setState('スキャン中');
   UI.scanBtn.disabled = true;
   UI.scanAbortBtn.disabled = false;
   clearDetectList();
-  try { if (UI.exportAllZipBtn) UI.exportAllZipBtn.disabled = true; } catch {}
   setScanProgress(0);
 
   scanAbortCtrl = new AbortController();
@@ -1520,11 +1452,8 @@ async function scanBandDecode(file){
   const audioCtx = analyzer.audioCtx;
   if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch {} }
 
-  // ---- noise learn (decode / per-bin baseline dB) ----
-  let baselineDb = null;
-  let baselineSr = 0;
-  let minBin0 = 0, maxBin0 = 0;
-
+  // ---- noise learn (decode) ----
+  let noiseFloorDb = -120;
   try{
     const ns = parseFloat(UI.noiseStartSec?.value ?? '5');
     const ne = parseFloat(UI.noiseEndSec?.value ?? '7');
@@ -1538,25 +1467,16 @@ async function scanBandDecode(file){
     const startByte = Math.max(0, Math.floor(startSec * bytesPerSecEst) - overlapBytes);
     const endByte = Math.min(file.size, Math.floor(endSec * bytesPerSecEst) + overlapBytes);
     const nab = await file.slice(startByte, endByte).arrayBuffer();
-
-    let nbuf;
-    try{
-      nbuf = await audioCtx.decodeAudioData(nab);
-    } catch(e){
-      throw new Error(`背景ノイズ区間 decode失敗: ${e?.message ?? e}`);
-    }
-
-    baselineSr = nbuf.sampleRate;
+    const nbuf = await audioCtx.decodeAudioData(nab);
+    const sr = nbuf.sampleRate;
     const monoN = nbuf.getChannelData(0);
 
-    const binHz = baselineSr / FFT_N;
-    minBin0 = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
-    maxBin0 = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
-    const bins = Math.max(1, (maxBin0 - minBin0 + 1));
-    baselineDb = new Float32Array(bins);
-    baselineDb.fill(-120);
+    const binHz = sr / FFT_N;
+    const minBin = clamp(Math.floor(lo / binHz), 0, FFT_N/2);
+    const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
 
     const hopN = FFT_N >> 1;
+    const bins = (maxBin - minBin + 1);
     const acc = new Float64Array(bins);
     let framesN = 0;
 
@@ -1566,32 +1486,31 @@ async function scanBandDecode(file){
         im[n] = 0;
       }
       fftInPlace(re, im, plan);
-      for (let b=minBin0; b<=maxBin0; b++){
+      for (let b=minBin; b<=maxBin; b++){
         const rr = re[b], ii = im[b];
-        acc[b-minBin0] += rr*rr + ii*ii;
+        acc[b-minBin] += rr*rr + ii*ii;
       }
       framesN++;
     }
 
+    let noiseFloorPow = 0;
     if (framesN > 0){
       for (let k=0;k<bins;k++){
-        baselineDb[k] = 10 * Math.log10((acc[k] / framesN) + 1e-12);
+        const mean = acc[k] / framesN;
+        if (mean > noiseFloorPow) noiseFloorPow = mean;
       }
-      const tmpArr = Array.from(baselineDb).sort((a,b)=>a-b);
-      const mid = tmpArr[Math.floor(tmpArr.length*0.5)];
-      logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / baseline≈${mid.toFixed(1)} dB (per-bin)`);
-    } else {
-      logLine('ノイズ学習: フレーム不足（baseline=-120dB扱い）');
+      noiseFloorDb = 10 * Math.log10(noiseFloorPow + 1e-12);
     }
+    logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / floor≈${noiseFloorDb.toFixed(1)} dB`);
   } catch(e){
+    console.warn('ノイズ学習失敗（継続）', e);
     logLine(`ノイズ学習失敗（継続）: ${e?.message ?? e}`);
-    baselineDb = null;
-    baselineSr = 0;
+    noiseFloorDb = -120;
   }
 
-  logLine(`スキャン開始: decode方式 / duration≈${duration.toFixed(2)}s / SEG=${SEG_SEC.toFixed(2)}s / FFT=${FFT_N}`);
+  logLine(`スキャン開始: decode方式 / duration≈${duration.toFixed(2)}s / SEG=5s / FFT=${FFT_N}`);
   logLine(`帯域: ${lo}..${hi} Hz / 検出感度(差分): +${thrDeltaDb} dB`);
-  logLine(`判定: SEG内で1フレームでも max( frameDb(bin) - baselineDb(bin) ) > +thr`);
+  logLine(`判定: 5秒内で1フレームでも (frameDb - noiseFloorDb) > +thr`);
 
   let lastDetectedBucket = -9999;
 
@@ -1599,104 +1518,76 @@ async function scanBandDecode(file){
     if (sig.aborted) throw new Error('スキャン中断');
 
     const segStartSec = seg * SEG_SEC;
-    const segEndSec = Math.min(duration, segStartSec + SEG_SEC);
-
-    // byte range (approx, with overlap)
     const startByte = Math.max(0, Math.floor(segStartSec * bytesPerSecEst) - overlapBytes);
-    const endByte = Math.min(file.size, Math.floor(segEndSec * bytesPerSecEst) + overlapBytes);
+    const endByte = Math.min(file.size, startByte + segBytes + overlapBytes);
 
-    let ab, buf;
-    try{
-      ab = await file.slice(startByte, endByte).arrayBuffer();
-    } catch(e){
-      logLine(`seg#${seg} slice失敗（スキップ）: ${e?.message ?? e}`);
-      setScanProgress((seg+1)/totalSeg*100);
-      await sleep(0);
-      continue;
-    }
+    let arrayBuf = null;
 
     try{
-      buf = await audioCtx.decodeAudioData(ab);
+      arrayBuf = await file.slice(startByte, endByte).arrayBuffer();
+      const audioBuf = await audioCtx.decodeAudioData(arrayBuf);
+      const sr = audioBuf.sampleRate;
+      const mono = audioBuf.getChannelData(0);
+
+      const binHz = sr / FFT_N;
+      const minBin = clamp(Math.floor(lo / binHz), 0, FFT_N/2);
+      const maxBin = clamp(Math.ceil(hi / binHz), 0, FFT_N/2);
+
+      const hop = FFT_N >> 1;
+      let detected = false;
+
+      for (let i=0; i + FFT_N <= mono.length; i += hop){
+        for (let n=0;n<FFT_N;n++){
+          re[n] = mono[i+n] * hannWindow(n, FFT_N);
+          im[n] = 0;
+        }
+        fftInPlace(re, im, plan);
+
+        let frameMaxPow = 0;
+        for (let b=minBin; b<=maxBin; b++){
+          const rr = re[b], ii = im[b];
+          const p = rr*rr + ii*ii;
+          if (p > frameMaxPow) frameMaxPow = p;
+        }
+        const frameDb = 10 * Math.log10(frameMaxPow + 1e-12);
+        if ((frameDb - noiseFloorDb) > thrDeltaDb){
+          detected = true;
+          break;
+        }
+        if (sig.aborted) break;
+      }
+
+      if (detected){
+        const bucket = seg;
+        if (bucket !== lastDetectedBucket){
+          lastDetectedBucket = bucket;
+          addDetectButton(bucket * SEG_SEC);
+        }
+      }
     } catch(e){
-      // boundary decode fail -> skip
-      logLine(`seg#${seg} decode失敗（スキップ）: ${e?.message ?? e}`);
-      setScanProgress((seg+1)/totalSeg*100);
-      await sleep(0);
-      continue;
+      console.warn('デコード失敗、スキップします', e);
+      logLine(`seg#${seg} decode失敗（skip）: ${e?.message ?? e}`);
+    } finally {
+      arrayBuf = null;
     }
 
-    const sr = buf.sampleRate;
-    const mono = buf.getChannelData(0);
-
-    const binHz = sr / FFT_N;
-    const minBin = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
-    const maxBin = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
-
-    // baseline mismatch -> fallback
-    const useBaseline = (baselineDb && baselineSr === sr && minBin === minBin0 && maxBin === maxBin0);
-
-    const hop = FFT_N >> 1;
-    let detected = false;
-
-    for (let i=0; i + FFT_N <= mono.length; i += hop){
-      for (let n=0;n<FFT_N;n++){
-        re[n] = mono[i+n] * hannWindow(n, FFT_N);
-        im[n] = 0;
-      }
-      fftInPlace(re, im, plan);
-
-      let maxDiffDb = -9999;
-      for (let b=minBin; b<=maxBin; b++){
-        const rr = re[b], ii = im[b];
-        const pow = rr*rr + ii*ii;
-        const frameDb = 10 * Math.log10(pow + 1e-12);
-        const base = useBaseline ? baselineDb[b-minBin] : -120;
-        const diff = frameDb - base;
-        if (diff > maxDiffDb) maxDiffDb = diff;
-      }
-
-      if (maxDiffDb >= thrDeltaDb) { detected = true; break; }
-      if (sig.aborted) throw new Error('スキャン中断');
-    }
-
-    if (detected){
-      const bucket = Math.floor(segStartSec / SEG_SEC);
-      if (bucket !== lastDetectedBucket){
-        addDetectButton(segStartSec);
-        lastDetectedBucket = bucket;
-      }
-    }
-
-    setScanProgress((seg+1)/totalSeg*100);
-    if (seg % 4 === 0) await sleep(0);
+    setScanProgress(((seg+1)/totalSeg)*100);
+    await sleep(0);
   }
-
-  logLine('スキャン完了');
-  setState('準備完了');
-  UI.scanAbortBtn.disabled = true;
 }
 
-
 async function scanBand(file){
-  // IMPORTANT:
-  // - WAV以外(例: MP3/M4A/OGG)は readWavHeader を呼ばず decode方式へ直行
-  // - WAVでもヘッダ/切れ目で失敗したら decode方式へフォールバックして完走を優先
-  const name = (file?.name || '').toLowerCase();
-  const type = (file?.type || '').toLowerCase();
-  const isWav = type.includes('wav') || name.endsWith('.wav') || name.endsWith('.wave');
-
+  // WAVならバイト計算で高速・確実。非WAV(MP3等)は decode方式へ。
   try{
-    if (isWav){
-      try{
-        await scanBandWav(file);
-        return;
-      } catch(e){
-        // WAVとして扱ったが失敗 -> decode方式へ切替
-        logLine(`WAV解析失敗→decode方式へ切替: ${e?.message ?? e}`);
-      }
-    }
+    await readWavHeader(file);
+    logLine('WAV形式検出 → WAV高速スキャン');
+    await scanBandWav(file);
+  } catch(e){
+    // ここは停止ではなくフォールバック
+    logLine('非WAV形式 → decode方式でスキャン');
     await scanBandDecode(file);
   } finally {
+    // UI復帰は必ず
     UI.scanBtn.disabled = false;
     UI.scanAbortBtn.disabled = true;
     scanAbortCtrl = null;
@@ -1710,7 +1601,7 @@ UI.scanBtn.addEventListener('click', async () => {
   if (!file) { alert('音声ファイルを選択してください'); return; }
 
   try {
-    await scanBandWav(file);
+    await scanBand(file);
   } catch (e) {
     const msg = e?.message ?? String(e);
     logLine(`スキャン停止: ${msg}`);
@@ -1727,6 +1618,6 @@ UI.scanAbortBtn.addEventListener('click', () => {
   if (scanAbortCtrl) scanAbortCtrl.abort();
 });
 
-wireScanSliders();
+try{ wireScanSliders(); } catch(e){ console.error(e); logLine('初期化エラー(wireScanSliders): '+(e?.message??e)); }
 
-clearAll();
+try{ clearAll(); } catch(e){ console.error(e); }

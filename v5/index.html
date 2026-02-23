@@ -134,7 +134,7 @@
 <body>
   <header>
     <div class="title">
-      <h1>野鳥の鳴き声 解析・可視化（WaveTone風タイムライン v2） <span id="buildLabel" class="pill" style="font-size:12px;opacity:.85;">BirdVoice_Log v5 (fix v14) 2026-02-23</span></h1>
+      <h1>野鳥の鳴き声 解析・可視化（WaveTone風タイムライン v2）<span id="buildLabel" class="pill mono" style="margin-left:10px;font-size:12px;opacity:.85">BirdVoice_Log v5 (fix v15) 2026-02-23</span></h1>
       <span class="badge">色マップ</span>
       <span class="badge">対数周波数</span>
       <span class="badge">鳥声帯域強調</span>
@@ -231,7 +231,6 @@
             <button id="pauseBtn" class="secondary" disabled>一時停止</button>
             <button id="stopBtn" class="danger" disabled>停止</button>
             <button id="exportViewBtn" class="secondary" disabled>PNG保存（表示中）</button>
-            <button id="exportAllZipBtn" class="secondary" disabled>全件ZIP保存</button>
             <button id="clearBtn" class="secondary">クリア</button>
           </div>
         </div>
@@ -272,7 +271,7 @@
             <div class="field">
               <label>検出感度（ノイズからの浮き上がり dB）</label>
               <input id="scanThreshold" type="range" min="0" max="80" step="1" value="15"/>
-              <div class="hint mono"><input id="scanThresholdVal" type="number" min="0" max="40" step="1" value="15" /> dB</div>
+              <div class="hint mono"><input id="scanThresholdVal" type="number" min="0" max="80" step="1" value="15" /> dB</div>
               <div class="note mono">例：背景より <b>15dB</b> 大きい瞬間を検出</div>
             </div>
           </div>
@@ -282,21 +281,35 @@
             <button id="presetOwl" class="ghost" type="button">フクロウ</button>
             <button id="presetTora" class="ghost" type="button">トラツグミ</button>
             <div class="flex-grow"></div>
+<div class="row" style="margin-top:10px">
+  <span class="pill mono">マイ・プリセット</span>
+  <button id="savePresetBtn" class="ghost" type="button">現在の設定を保存</button>
+  <div class="flex-grow"></div>
+</div>
+
+<div class="detect-wrap">
+  <div class="subhead">マイ・プリセット（クリックで適用）</div>
+  <div id="myPresetList" class="detect-list"></div>
+</div>
+
           </div>
 
           <div class="row" style="margin-top:10px">
             <span class="pill mono">解析単位(秒)</span>
-            <input id="scanSegSec" type="number" min="0.5" max="30" step="0.1" value="2.0" />
-            <span class="pill mono">（0.5〜10.0）</span>
+            <input id="scanSegSecRange" type="range" min="0.5" max="10.0" step="0.1" value="2.0"/>
+            <div class="hint mono"><input id="scanSegSec" type="number" min="0.5" max="30.0" step="0.1" value="2.0" /> s</div>
+            <span class="pill mono">（0.5〜30.0）</span>
             <div class="flex-grow"></div>
           </div>
 
           <div class="row" style="margin-top:10px">
             <span class="pill mono">背景ノイズ学習範囲(秒)</span>
             <label class="mono">開始</label>
-            <input id="noiseStartSec" type="number" min="0" step="0.1" value="5" />
+            <input id="noiseStartRange" type="range" min="0" max="600" step="0.1" value="5"/>
+            <div class="hint mono"><input id="noiseStartSec" type="number" min="0" step="0.1" value="5" /> s</div>
             <label class="mono">終了</label>
-            <input id="noiseEndSec" type="number" min="0" step="0.1" value="7" />
+            <input id="noiseEndRange" type="range" min="0" max="600" step="0.1" value="7"/>
+            <div class="hint mono"><input id="noiseEndSec" type="number" min="0" step="0.1" value="7" /> s</div>
             <span class="pill mono">（この区間を背景ノイズとして学習）</span>
             <div class="flex-grow"></div>
           </div>
@@ -305,6 +318,8 @@
           <div class="row">
             <button id="scanBtn" class="primary" disabled>全時間スキャン開始</button>
             <button id="scanAbortBtn" class="ghost" disabled>中断</button>
+            <button id="exportAllBtn" class="ghost" disabled>解析結果を全出力（全件一括保存）</button>
+            <span id="exportAllMsg" class="pill mono" style="display:none">出力中...</span>
             <div class="flex-grow"></div>
             <span class="pill mono">進捗: <strong id="scanPct">0%</strong></span>
           </div>
@@ -346,6 +361,7 @@
     <audio id="fullAudio" controls style="width:100%; margin-top:14px; display:none;"></audio>
   </main>
 
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
   <script src="./script.js"></script>
 </body>
 </html>
