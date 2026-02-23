@@ -268,39 +268,6 @@ function lruPrune(maxTiles) {
   }
 }
 
-
-/** ===================== Settings (localStorage) ===================== */
-const BVLOG_VERSION = 'BirdVoice_Log v5 (fix v12)';
-const BVLOG_SETTINGS_KEY = 'bvlog_scan_settings_v5';
-
-function bvlogLoadSettings(){
-  try{
-    const raw = localStorage.getItem(BVLOG_SETTINGS_KEY);
-    if (!raw) return null;
-    const obj = JSON.parse(raw);
-    if (!obj || typeof obj !== 'object') return null;
-    return obj;
-  }catch(e){
-    console.warn('[settings] load failed', e);
-    return null;
-  }
-}
-
-function bvlogSaveSettings(obj){
-  try{
-    localStorage.setItem(BVLOG_SETTINGS_KEY, JSON.stringify(obj));
-  }catch(e){
-    console.warn('[settings] save failed', e);
-  }
-}
-
-function bvlogApplyVersionBadge(){
-  try{
-    const el = document.getElementById('appVer');
-    if (el) el.textContent = BVLOG_VERSION;
-    console.log('[boot]', BVLOG_VERSION);
-  }catch{}
-}
 /** ===================== Spectrogram rendering ===================== */
 const AXIS_W = 62;
 const PAD_T = 10;
@@ -966,17 +933,6 @@ function addDetectButton(sec){
 function wireScanSliders(){
   const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-  // restore saved scan settings (UI is unchanged)
-  const saved = (typeof localStorage !== 'undefined') ? bvlogLoadSettings() : null;
-  if (saved) {
-    if (UI.scanMinHz && Number.isFinite(saved.minHz)) UI.scanMinHz.value = String(saved.minHz);
-    if (UI.scanMaxHz && Number.isFinite(saved.maxHz)) UI.scanMaxHz.value = String(saved.maxHz);
-    if (UI.scanThreshold && Number.isFinite(saved.thr)) UI.scanThreshold.value = String(saved.thr);
-    if (UI.scanSegSec && Number.isFinite(saved.segSec)) UI.scanSegSec.value = String(saved.segSec);
-    if (UI.noiseStartSec && Number.isFinite(saved.noiseStart)) UI.noiseStartSec.value = String(saved.noiseStart);
-    if (UI.noiseEndSec && Number.isFinite(saved.noiseEnd)) UI.noiseEndSec.value = String(saved.noiseEnd);
-  }
-
   const syncAll = () => {
     let min = parseInt(UI.scanMinHz.value,10);
     let max = parseInt(UI.scanMaxHz.value,10);
@@ -989,7 +945,7 @@ function wireScanSliders(){
     max = clampNum(max, 0, 24000);
     if (min > max) max = min;
 
-    thr = clampNum(thr, 0, 80);
+    thr = clampNum(thr, 0, 40);
 
     UI.scanMinHz.value = String(min);
     UI.scanMaxHz.value = String(max);
@@ -999,20 +955,6 @@ function wireScanSliders(){
     if (UI.scanMinHzVal) UI.scanMinHzVal.value = String(min);
     if (UI.scanMaxHzVal) UI.scanMaxHzVal.value = String(max);
     if (UI.scanThresholdVal) UI.scanThresholdVal.value = String(thr);
-  };
-
-  const saveAll = () => {
-    const obj = {
-      minHz: parseInt(UI.scanMinHz?.value||'0',10),
-      maxHz: parseInt(UI.scanMaxHz?.value||'0',10),
-      thr: parseInt(UI.scanThreshold?.value||'0',10),
-      segSec: parseFloat(UI.scanSegSec?.value||'0'),
-      noiseStart: parseFloat(UI.noiseStartSec?.value||'0'),
-      noiseEnd: parseFloat(UI.noiseEndSec?.value||'0'),
-      preset: null,
-      savedAt: Date.now()
-    };
-    bvlogSaveSettings(obj);
   };
 
   // range -> number
@@ -1026,21 +968,18 @@ function wireScanSliders(){
     if (!Number.isFinite(v)) return;
     UI.scanMinHz.value = String(v);
     syncAll();
-    saveAll();
   });
   UI.scanMaxHzVal?.addEventListener('input', () => {
     const v = parseInt(UI.scanMaxHzVal.value,10);
     if (!Number.isFinite(v)) return;
     UI.scanMaxHz.value = String(v);
     syncAll();
-    saveAll();
   });
   UI.scanThresholdVal?.addEventListener('input', () => {
     const v = parseInt(UI.scanThresholdVal.value,10);
     if (!Number.isFinite(v)) return;
     UI.scanThreshold.value = String(v);
     syncAll();
-    saveAll();
   });
 
   // presets (min/max Hz, segSec, thrDelta dB)
@@ -1050,22 +989,19 @@ function wireScanSliders(){
     UI.scanThreshold.value = String(thrDelta);
     if (UI.scanSegSec) UI.scanSegSec.value = String(segSec);
     syncAll();
-    saveAll();
-    saveAll();
   };
-  UI.presetNight?.addEventListener('click', () => { setPreset(800, 4000, 2.0, 12); saveAll(); });
-  UI.presetOwl?.addEventListener('click', () => { setPreset(400, 1200, 3.0, 10); saveAll(); });
-  UI.presetTora?.addEventListener('click', () => { setPreset(2000, 2800, 1.0, 15); saveAll(); });
+  UI.presetNight?.addEventListener('click', () => setPreset(800, 4000, 2.0, 12));
+  UI.presetOwl?.addEventListener('click', () => setPreset(400, 1200, 3.0, 10));
+  UI.presetTora?.addEventListener('click', () => setPreset(2000, 2800, 1.0, 15));
 
   // seg sec clamp
   UI.scanSegSec?.addEventListener('input', () => {
     const v = parseFloat(UI.scanSegSec.value);
     if (!Number.isFinite(v)) return;
-    UI.scanSegSec.value = String(clamp(v, 0.5, 30.0));
+    UI.scanSegSec.value = String(clamp(v, 0.5, 10.0));
   });
 
   syncAll();
-    saveAll();
 }
 
 async function readWavHeader(file){
@@ -1561,36 +1497,39 @@ async function scanBandDecode(file){
 
 
 async function scanBand(file){
-  // IMPORTANT:
-  // - WAV以外(例: MP3/M4A/OGG)は readWavHeader を呼ばず decode方式へ直行
-  // - WAVでもヘッダ/切れ目で失敗したら decode方式へフォールバックして完走を優先
+  // 仕様:
+  // - WAVなら scanBandWav(file)（バイト計算方式）
+  // - 非WAV(MP3等)は scanBandDecode(file)（decode方式）
+  // - WAV判定でも失敗したら decodeへフォールバック（停止ではない）
   const name = (file?.name || '').toLowerCase();
   const type = (file?.type || '').toLowerCase();
   const isWav = type.includes('wav') || name.endsWith('.wav') || name.endsWith('.wave');
 
-  try{
-    if (isWav){
-      try{
-        await scanBand(file);
-        return;
-      } catch(e){
-        // WAVとして扱ったが失敗 -> decode方式へ切替
-        logLine(`WAV解析失敗→decode方式へ切替: ${e?.message ?? e}`);
-      }
+  if (isWav){
+    try{
+      await scanBandWav(file);
+      return;
+    } catch(e){
+      logLine(`WAV解析失敗→decode方式へ切替: ${e?.message ?? e}`);
+      // フォールバック継続
     }
-    await scanBandDecode(file);
-  } finally {
-    UI.scanBtn.disabled = false;
-    UI.scanAbortBtn.disabled = true;
-    scanAbortCtrl = null;
-    setState('準備完了');
-    setScanProgress(0);
+  } else {
+    // フォールバック対象（停止ではない）
+    logLine('非WAV→decode方式で解析します');
   }
+
+  await scanBandDecode(file);
 }
 
 UI.scanBtn.addEventListener('click', async () => {
   const file = UI.fileInput.files?.[0];
   if (!file) { alert('音声ファイルを選択してください'); return; }
+
+  // ここで初期化（固まり判定を避ける）
+  UI.scanBtn.disabled = true;
+  UI.scanAbortBtn.disabled = false;
+  scanAbortCtrl = new AbortController();
+  setScanProgress(0);
 
   try {
     await scanBand(file);
@@ -1602,9 +1541,10 @@ UI.scanBtn.addEventListener('click', async () => {
     UI.scanBtn.disabled = false;
     UI.scanAbortBtn.disabled = true;
     scanAbortCtrl = null;
-    setScanProgress(0);
+    // ※進捗は結果表示のまま残す（0%に戻さない）
   }
 });
+
 
 UI.scanAbortBtn.addEventListener('click', () => {
   if (scanAbortCtrl) scanAbortCtrl.abort();
@@ -1613,5 +1553,3 @@ UI.scanAbortBtn.addEventListener('click', () => {
 wireScanSliders();
 
 clearAll();
-
-try{ bvlogApplyVersionBadge(); }catch{}
