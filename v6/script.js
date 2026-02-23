@@ -692,13 +692,37 @@ function stopPlayheadLoop() {
   if (playingRaf) { cancelAnimationFrame(playingRaf); playingRaf = 0; }
 }
 
+// 再生リクエストの連番管理（連打・競合防止）
+let _playSeq = 0;
+
 async function playFrom(timeSec) {
   if (!analyzer.inited) return;
+
+  // 新しいリクエストの番号を確保
+  const seq = ++_playSeq;
+
+  // ① 先に必ず一時停止してから seek（play/pause 競合を防ぐ）
+  try { UI.fullAudio.pause(); } catch {}
   UI.fullAudio.style.display = 'block';
   UI.fullAudio.currentTime = clamp(timeSec, 0, analyzer.duration);
-  await sleep(40);
-  try { await UI.fullAudio.play(); }
-  catch (e) { logLine(`再生失敗: ${e?.message ?? e}`); return; }
+
+  // ② 1フレーム分だけ待って currentTime を確定させる
+  await sleep(0);
+
+  // 自分より新しいリクエストが来ていたら何もしない
+  if (seq !== _playSeq) return;
+
+  try {
+    await UI.fullAudio.play();
+  } catch (e) {
+    // AbortError はブラウザが連続 play() を中断しただけなので無視
+    if (e?.name === 'AbortError') return;
+    logLine(`再生失敗: ${e?.message ?? e}`);
+    return;
+  }
+
+  if (seq !== _playSeq) { try { UI.fullAudio.pause(); } catch {} return; }
+
   startPlayheadLoop();
   scheduleRender();
 }
@@ -1569,79 +1593,111 @@ async function generateDetectionSpectrogram(file, timeSec, halfSec = 5) {
   const startByte = Math.max(0, Math.floor(clipStart * bytesPerSecEst) - overlapBytes);
   const endByte   = Math.min(file.size, Math.ceil(clipEnd * bytesPerSecEst) + overlapBytes);
 
-  const ab = await file.slice(startByte, endByte).arrayBuffer();
-  // decodeAudioData はバッファを消費するのでコピーしてから渡す
+  const ab  = await file.slice(startByte, endByte).arrayBuffer();
   const buf = await analyzer.audioCtx.decodeAudioData(ab);
 
-  const sr = buf.sampleRate;
+  const sr   = buf.sampleRate;
   const mono = buf.getChannelData(0);
+  const cfg  = getConfig();
 
-  const cfg = getConfig();
+  const FFT_N   = clamp(nextPow2(cfg.fftSize), 512, 4096);
+  const halfFFT = (FFT_N >> 1) - 1;
+  const plan    = makeFft(FFT_N);
+  const re      = new Float32Array(FFT_N);
+  const im      = new Float32Array(FFT_N);
+  const binHz   = sr / FFT_N;
 
-  // FFT サイズは必ず2のべき乗に丸める（makeFft の前提）
-  const FFT_N = clamp(nextPow2(cfg.fftSize), 512, 4096);
-  const plan = makeFft(FFT_N);
-  const re = new Float32Array(FFT_N);
-  const im = new Float32Array(FFT_N);
+  // ── LUT 1: Hann窓 ───────────────────────────────────────────────
+  // 毎列 FFT_N 回の Math.cos を 1 回の事前計算に削減
+  const hannLUT = new Float32Array(FFT_N);
+  for (let n = 0; n < FFT_N; n++) {
+    hannLUT[n] = 0.5 * (1.0 - Math.cos((2 * Math.PI * n) / (FFT_N - 1)));
+  }
 
-  const binHz = sr / FFT_N;
-  const invRange = 1.0 / Math.max(1e-6, cfg.maxDb - cfg.minDb);
+  // ── LUT 2: y行 → FFT bin インデックス ───────────────────────────
+  // 毎列 TILE_H 回の Math.log/exp を 1 回の事前計算に削減
+  const height  = TILE_H;
+  const binLUT  = new Int32Array(height);
+  for (let y = 0; y < height; y++) {
+    const hz = yToHzByScale(y, cfg, height);
+    binLUT[y] = clamp(Math.round(hz / binHz), 0, halfFFT);
+  }
 
-  // 1列 = 1フレーム（FPS に合わせたホップ幅）
-  const samplesPerCol = Math.max(1, Math.floor(sr / cfg.fps));
-  const width  = Math.max(1, Math.ceil(clipDur * cfg.fps));
-  const height = TILE_H; // 512px（既存と同解像度）
+  // ── LUT 3: カラーパレット（1024エントリ × RGB）──────────────────
+  // 毎ピクセルの mapColor 関数呼び出し＋switch＋配列分割を排除
+  const CLUT_N   = 1024;
+  const CLUT_MAX = CLUT_N - 1;
+  const colorLUT = new Uint8Array(CLUT_N * 3);
+  for (let i = 0; i < CLUT_N; i++) {
+    const [r, g, b] = mapColor(cfg.colorMap, i / CLUT_MAX);
+    colorLUT[i * 3]     = r;
+    colorLUT[i * 3 + 1] = g;
+    colorLUT[i * 3 + 2] = b;
+  }
+
+  // ── 出力幅: 静止画なので 30fps で十分（FFT 回数を半減）──────────
+  const EXPORT_FPS    = clamp(Math.min(cfg.fps, 30), 10, 60);
+  const samplesPerCol = Math.max(1, Math.floor(sr / EXPORT_FPS));
+  const width         = Math.max(1, Math.ceil(clipDur * EXPORT_FPS));
 
   const oc = (typeof OffscreenCanvas !== 'undefined')
     ? new OffscreenCanvas(width, height)
-    : (() => { const c = document.createElement('canvas'); c.width=width; c.height=height; return c; })();
+    : (() => { const c = document.createElement('canvas'); c.width = width; c.height = height; return c; })();
 
-  const ctx = oc.getContext('2d');
+  const ctx     = oc.getContext('2d');
   const imgData = ctx.createImageData(width, height);
-  const data = imgData.data;
-  const halfFFT = (FFT_N >> 1) - 1;
+  const data    = imgData.data;
+
+  // Math.log(x) より Math.log10 が遅いブラウザへの対策
+  // 10*log10(x) = (10/ln10) * ln(x)
+  const LOG10_SCALE = 10.0 / Math.LN10;
+  const invRange    = 1.0 / Math.max(1e-6, cfg.maxDb - cfg.minDb);
+  const minDb       = cfg.minDb;
+
+  // 画像の alpha 値をまとめて 255 で初期化
+  for (let i = 3; i < data.length; i += 4) data[i] = 255;
 
   for (let x = 0; x < width; x++) {
     const sampleStart = x * samplesPerCol;
+    const xBase       = x * 4;                   // 列先頭のバイトオフセット（stride=width*4）
+
     if (sampleStart + FFT_N > mono.length) {
-      // 末尾が足りない → 前フレームのデータを繰り返す（または黒で塗り）
+      // 末尾: 前の列をそのままコピー
       if (x > 0) {
+        const prevXBase = (x - 1) * 4;
+        const stride    = width * 4;
         for (let y = 0; y < height; y++) {
-          const src = (y * width + (x - 1)) * 4;
-          const dst = (y * width + x) * 4;
-          data[dst]   = data[src];
-          data[dst+1] = data[src+1];
-          data[dst+2] = data[src+2];
-          data[dst+3] = 255;
+          const row = y * stride;
+          data[row + xBase]     = data[row + prevXBase];
+          data[row + xBase + 1] = data[row + prevXBase + 1];
+          data[row + xBase + 2] = data[row + prevXBase + 2];
         }
       }
       continue;
     }
 
-    // Hann窓 FFT
+    // Hann窓 + FFT（LUT で cos 計算ゼロ）
     for (let n = 0; n < FFT_N; n++) {
-      re[n] = mono[sampleStart + n] * hannWindow(n, FFT_N);
+      re[n] = mono[sampleStart + n] * hannLUT[n];
       im[n] = 0;
     }
     fftInPlace(re, im, plan);
 
-    // 各行 → Hz → bin → dB → 色
+    // ピクセル列を書き込む（LUT で log/exp・関数呼び出しゼロ）
+    const stride = width * 4;
     for (let y = 0; y < height; y++) {
-      const hz  = yToHzByScale(y, cfg, height);
-      const bin = clamp(Math.round(hz / binHz), 0, halfFFT);
-      const rr  = re[bin], ii = im[bin];
-      const db  = 10 * Math.log10(rr*rr + ii*ii + 1e-12);
-      const norm = clamp((db - cfg.minDb) * invRange, 0, 1);
-      const [r, g, b] = mapColor(cfg.colorMap, norm);
-      const idx = (y * width + x) * 4;
-      data[idx]   = r;
-      data[idx+1] = g;
-      data[idx+2] = b;
-      data[idx+3] = 255;
+      const bin  = binLUT[y];
+      const rr   = re[bin], ii = im[bin];
+      const db   = LOG10_SCALE * Math.log(rr * rr + ii * ii + 1e-12);
+      const ci   = clamp(((db - minDb) * invRange * CLUT_MAX + 0.5) | 0, 0, CLUT_MAX) * 3;
+      const idx  = y * stride + xBase;
+      data[idx]     = colorLUT[ci];
+      data[idx + 1] = colorLUT[ci + 1];
+      data[idx + 2] = colorLUT[ci + 2];
     }
 
-    // ブラウザを詰まらせないよう16列ごとに1tick譲る
-    if (x % 16 === 15) await sleep(0);
+    // 全列がオフスクリーン処理なので yield は 128 列に 1 回で十分
+    if ((x & 127) === 127) await sleep(0);
   }
 
   ctx.putImageData(imgData, 0, 0);
