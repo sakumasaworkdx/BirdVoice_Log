@@ -518,7 +518,7 @@ async function generateTileBitmap(tileIndex, cfg, abortSignal) {
     const LOG10_SCALE = 10.0 / Math.LN10;
     const invRange    = 1.0 / Math.max(1e-6, cfg.maxDb - cfg.minDb);
     const minDb       = cfg.minDb;
-    const normDb      = 20.0 * Math.log10(2.0 / FFT_N);
+    const normDb      = -20.0 * Math.log10(FFT_N); // Chromium: scaler=1/N → -20*log10(N)
 
     for (let i = 3; i < data.length; i += 4) data[i] = 255;
 
@@ -1679,12 +1679,9 @@ async function generateDetectionSpectrogram(file, timeSec, halfSec = 5) {
   const minDb       = cfg.minDb;
 
   // ── Web Audio AnalyserNode との dB スケール一致補正 ────────────────
-  // AnalyserNode は magnitude を (2 / FFT_N) で正規化してから dBFS に変換する:
-  //   db_webaudio = 20*log10( |X[k]| * 2/FFT_N )
-  //               = 10*log10(re²+im²) + 20*log10(2/FFT_N)
-  // この補正値を加算するだけでブラウザ表示と同じ色合いになる
-  // 例: FFT_N=1024 → normDb≈-54.2dB, FFT_N=2048 → ≈-60.2dB
-  const normDb = 20.0 * Math.log10(2.0 / FFT_N);
+  // Chromium RealtimeAnalyser は scaler=1/N で正規化 → normDb = -20*log10(N)
+  // 例: FFT_N=1024 → normDb≈-60.2dB, FFT_N=2048 → ≈-66.2dB
+  const normDb = -20.0 * Math.log10(FFT_N);
 
   // 画像の alpha 値をまとめて 255 で初期化
   for (let i = 3; i < data.length; i += 4) data[i] = 255;
