@@ -268,9 +268,10 @@
         <div class="hr"></div>
 
         <div class="card">
-          <div class="card-title">帯域スキャン（巨大WAV向け / 5秒単位）</div>
+          <div class="card-title">帯域スキャン（全フォーマット対応）</div>
           <div class="note">
-            ※ MP3/WAV等に対応（file.slice() → decodeAudioData → FFT解析）。MP3は圧縮の都合で分割境界で decode 失敗する場合がありますが、そのセグメントはスキップして継続します。
+            WAV/MP3/AAC等に対応。WAVはPCM直接変換、MP3/AACはセグメントデコード（チャンクLRUキャッシュ方式）。<br/>
+            MP3は圧縮の都合でデコード失敗する場合がありますが、そのセグメントはスキップして継続します。
           </div>
 
           <div class="grid3">

@@ -2,6 +2,14 @@
 'use strict';
 
 /**
+ * v5 追加
+ * - 解析結果を全出力（全件一括保存 ZIP）
+ *   - スペクトラム全件オフスクリーン画像（JPG）
+ *   - 音声全件切り出し（WAV, ±5秒）
+ *   - CSV（検出時刻・画像ファイル名）
+ *   - JSZip で一括 ZIP ダウンロード
+ *   - async/await 逐次処理 + 進捗表示
+ *
  * v2 追加
  * - 色マップ（Turbo/Magma/Viridis/Gray）
  * - 対数周波数軸（log / linear 切替）
@@ -48,6 +56,10 @@ const UI = {
   scanPct: document.getElementById('scanPct'),
   scanBar: document.getElementById('scanBar'),
   detectList: document.getElementById('detectList'),
+
+  // bulk export
+  exportAllBtn: document.getElementById('exportAllBtn'),
+  exportProgress: document.getElementById('exportProgress'),
 
   prepareBtn: document.getElementById('prepareBtn'),
   playBtn: document.getElementById('playBtn'),
@@ -108,9 +120,7 @@ function downloadBlob(blob, filename) {
 }
 
 /** ===================== Color maps ===================== */
-// lightweight colormap functions (0..1 -> [r,g,b])
 function turbo(t){
-  // Approximation (same spirit as Turbo), clipped
   t = clamp(t,0,1);
   const r = clamp(34.61 + t*(1172.33 + t*(-10793.56 + t*(33300.12 + t*(-38394.49 + t*14825.05)))), 0, 255);
   const g = clamp(23.31 + t*(557.33 + t*(1225.33 + t*(-3574.96 + t*(1858.50 + t*0.00)))), 0, 255);
@@ -118,7 +128,6 @@ function turbo(t){
   return [r|0, g|0, b|0];
 }
 function viridis(t){
-  // small piecewise approximation via 5 anchors
   t = clamp(t,0,1);
   const stops = [
     [68, 1, 84],
@@ -172,12 +181,6 @@ function mapColor(name, t){
 /** ===================== Analyzer (seek) ===================== */
 let analyzer = {
   file: null,
-  url: null,
-  audio: null,
-  audioCtx: null,
-  src: null,
-  analyser: null,
-  gain: null,
   inited: false,
   duration: 0,
 };
@@ -204,41 +207,342 @@ async function ensureFullAudioMetadata(file) {
 }
 
 async function initAnalyzerForFile(file) {
-  if (analyzer.url) { try { URL.revokeObjectURL(analyzer.url); } catch {} }
-  analyzer.url = URL.createObjectURL(file);
-
-  if (!analyzer.audio) analyzer.audio = document.createElement('audio');
-  analyzer.audio.src = analyzer.url;
-  analyzer.audio.preload = 'auto';
-  analyzer.audio.volume = 1.0;
-  analyzer.audio.muted = false;
-
-  await new Promise((resolve, reject) => {
-    const ok = () => { cleanup(); resolve(); };
-    const ng = () => { cleanup(); reject(new Error('解析用audioの準備に失敗')); };
-    const cleanup = () => {
-      analyzer.audio.removeEventListener('canplay', ok);
-      analyzer.audio.removeEventListener('error', ng);
-    };
-    analyzer.audio.addEventListener('canplay', ok, { once:true });
-    analyzer.audio.addEventListener('error', ng, { once:true });
-    analyzer.audio.load();
-  });
-
-  if (!analyzer.audioCtx) {
-    analyzer.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    analyzer.src = analyzer.audioCtx.createMediaElementSource(analyzer.audio);
-    analyzer.analyser = analyzer.audioCtx.createAnalyser();
-    analyzer.gain = analyzer.audioCtx.createGain();
-    analyzer.gain.gain.value = 0.0; // 無音化はGainで（muted禁止）
-    analyzer.src.connect(analyzer.analyser);
-    analyzer.analyser.connect(analyzer.gain);
-    analyzer.gain.connect(analyzer.audioCtx.destination);
-  }
-
+  // 新方式ではAnalyserNode/MediaElementSourceは不要
+  // 再生は UI.fullAudio で直接行い、解析はオフラインFFTで行う
   analyzer.file = file;
   analyzer.inited = true;
+  logLine(`ファイル準備完了: ${file.name}`);
 }
+
+// ── Audio Chunk Cache ────────────────────────────────────────────────────────
+// MP3/AACはバイトスライスでdecodeAudioDataできないため、ファイル全体を1回デコードする。
+// 長尺ファイルのメモリ問題を解決するため、デコード直後に5分チャンクへ分割して
+// ── Audio Chunk Cache ────────────────────────────────────────────────────────
+//
+// 設計目標: 8時間ファイルを1GB以内で処理
+//
+// フォーマット別戦略:
+//   WAV  → RIFFヘッダーを読んでPCMバイトを直接Float32変換（デコード不要・ピーク50MB以下）
+//   MP3/AAC → 15分セグメント単位でdecodeAudioData（ピーク≈150MB）
+//
+// 共通: チャンクはLRUで最大6個（≈180〜300MB）だけ保持し古いものを自動解放
+
+const AUDIO_CHUNK_SEC  = 5 * 60;   // 1チャンク = 5分
+const MAX_AUDIO_CHUNKS = 6;         // LRU上限（ピーク + 保持 ≦ 約1GB に収まる値）
+
+// MP3/AACをセグメント単位でデコードする際の1セグメントの長さ
+// 長いほど確実にデコードできるが、ピークメモリが増える（15分 ≈ 150MB）
+const DECODE_SEG_SEC   = 15 * 60;
+const DECODE_OVERLAP_SEC = 2;       // セグメント境界で音が途切れないよう前後に余裕
+
+// Map<chunkIndex, { mono: Float32Array, sr: number, lastUsed: number }>
+const audioChunkCache = new Map();
+
+// チャンク生成中のPromiseを管理（同一チャンクの重複デコードを防ぐ）
+const _chunkInflight = new Map(); // chunkIdx → Promise
+
+let _audioChunkFile = null;  // 現在キャッシュ対象のFileオブジェクト
+let _wavInfo        = null;  // WAVのみ: パース済みヘッダー情報
+let _sharedDecodeCtx = null; // MP3/AAC: AudioContextを使い回す（ブラウザの上限対策）
+
+// ── キャッシュ管理 ────────────────────────────────────────────────────────
+
+function clearAudioChunkCache() {
+  audioChunkCache.clear();
+  _chunkInflight.clear();
+  _audioChunkFile = null;
+  _wavInfo        = null;
+  // shared decode contextはclose()しない（再利用するため）
+  // ファイル切り替え時のキャッシュクリアだけ行う
+}
+
+function pruneAudioChunks() {
+  if (audioChunkCache.size <= MAX_AUDIO_CHUNKS) return;
+  const sorted = [...audioChunkCache.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+  for (const [k] of sorted.slice(0, audioChunkCache.size - MAX_AUDIO_CHUNKS)) {
+    audioChunkCache.delete(k);
+  }
+}
+
+function releaseFullBuffer() { clearAudioChunkCache(); }
+
+// ── WAVヘッダーパーサー ───────────────────────────────────────────────────
+
+async function parseWavHeader(file) {
+  // BWF/iXML/大きなID3タグ付きWAVに対応するため十分なサイズを読む
+  // ただしファイルサイズ以上は読まない
+  const READ_SIZE = Math.min(file.size, 65536);
+  const headerAb = await file.slice(0, READ_SIZE).arrayBuffer();
+  const dv       = new DataView(headerAb);
+  const txt      = s => String.fromCharCode(...new Uint8Array(headerAb, s, 4));
+
+  if (txt(0) !== 'RIFF' || txt(8) !== 'WAVE') throw new Error('WAVフォーマットではありません');
+
+  let offset = 12;
+  let audioFmt = 0, channels = 0, sampleRate = 0, bitsPerSample = 0;
+  let dataOffset = 0, dataSize = 0;
+
+  while (offset + 8 <= READ_SIZE) {
+    const id   = txt(offset);
+    const size = dv.getUint32(offset + 4, true);
+    if (id === 'fmt ') {
+      audioFmt     = dv.getUint16(offset + 8,  true); // 1=PCM, 3=IEEE Float
+      channels     = dv.getUint16(offset + 10, true);
+      sampleRate   = dv.getUint32(offset + 12, true);
+      bitsPerSample = dv.getUint16(offset + 22, true);
+    } else if (id === 'data') {
+      dataOffset = offset + 8;
+      dataSize   = size;
+      break;
+    }
+    // dataチャンクが読み込み範囲を超える場合: サイズ分スキップすると
+    // READ_SIZE外に出るので、そこで探索打ち切り → dataOffset=0 のまま
+    const nextOffset = offset + 8 + size + (size & 1);
+    if (nextOffset <= offset) break; // サイズ異常によるループ防止
+    offset = nextOffset;
+  }
+
+  if (!sampleRate || !dataOffset) throw new Error('WAVヘッダー解析失敗（dataチャンクが見つかりません。BWF等の場合はヘッダーが大きすぎる可能性があります）');
+  if (audioFmt !== 1 && audioFmt !== 3) throw new Error(`非対応WAVフォーマット (audioFmt=${audioFmt})`);
+
+  const bytesPerSample = bitsPerSample >> 3;
+  const blockAlign     = channels * bytesPerSample;
+  const totalSamples   = Math.floor(dataSize / blockAlign);
+  const duration       = totalSamples / sampleRate;
+
+  return { sampleRate, channels, bitsPerSample, audioFmt, dataOffset, dataSize, bytesPerSample, blockAlign, totalSamples, duration };
+}
+
+/**
+ * WAV PCMバイトをFloat32に変換（デコード不要・低メモリ）
+ */
+function pcmBytesToFloat32(ab, bitsPerSample, audioFmt) {
+  const dv = new DataView(ab);
+  const n  = ab.byteLength / (bitsPerSample >> 3);
+  const out = new Float32Array(n);
+  if (audioFmt === 3) { // 32bit IEEE float
+    for (let i = 0; i < n; i++) out[i] = dv.getFloat32(i * 4, true);
+  } else if (bitsPerSample === 16) {
+    const inv = 1 / 32768;
+    for (let i = 0; i < n; i++) out[i] = dv.getInt16(i * 2, true) * inv;
+  } else if (bitsPerSample === 24) {
+    const inv = 1 / 8388608;
+    for (let i = 0; i < n; i++) {
+      const b0 = dv.getUint8(i*3), b1 = dv.getUint8(i*3+1), b2 = dv.getUint8(i*3+2);
+      const v  = (b2 << 16) | (b1 << 8) | b0;
+      out[i]   = ((v & 0x800000) ? v - 0x1000000 : v) * inv;
+    }
+  } else if (bitsPerSample === 8) {
+    const inv = 1 / 128;
+    for (let i = 0; i < n; i++) out[i] = (dv.getUint8(i) - 128) * inv;
+  } else if (bitsPerSample === 32) {
+    const inv = 1 / 2147483648;
+    for (let i = 0; i < n; i++) out[i] = dv.getInt32(i * 4, true) * inv;
+  }
+  return out;
+}
+
+// ── チャンク取得（フォーマット自動判別） ─────────────────────────────────
+
+function isWavFile(file) {
+  const n = (file?.name || '').toLowerCase();
+  const t = (file?.type || '').toLowerCase();
+  return t.includes('wav') || n.endsWith('.wav') || n.endsWith('.wave');
+}
+
+/**
+ * 指定チャンクのモノラルFloat32を返す（キャッシュ優先）。
+ * WAVは直接PCM変換、MP3/AACはセグメントデコード。
+ */
+async function fetchAudioChunk(chunkIdx, file) {
+  // キャッシュヒット
+  const cached = audioChunkCache.get(chunkIdx);
+  if (cached) { cached.lastUsed = Date.now(); return cached; }
+
+  // 重複取得防止
+  if (_chunkInflight.has(chunkIdx)) {
+    return _chunkInflight.get(chunkIdx);
+  }
+
+  const promise = (async () => {
+    const chunkStartSec = chunkIdx * AUDIO_CHUNK_SEC;
+    const chunkEndSec   = chunkStartSec + AUDIO_CHUNK_SEC;
+
+    let mono, sr;
+
+    if (isWavFile(file)) {
+      // ── WAV: PCMバイト直接変換 ─────────────────────────────────────────
+      if (!_wavInfo) _wavInfo = await parseWavHeader(file);
+      const info = _wavInfo;
+      sr = info.sampleRate;
+
+      const startSample = Math.min(info.totalSamples, Math.floor(chunkStartSec * sr));
+      const endSample   = Math.min(info.totalSamples, Math.ceil(Math.min(chunkEndSec, info.duration) * sr));
+
+      // チャンネルをインタリーブで読む → チャンネル0だけ抽出
+      const startByte = info.dataOffset + startSample * info.blockAlign;
+      const endByte   = info.dataOffset + endSample   * info.blockAlign;
+      const ab        = await file.slice(startByte, endByte).arrayBuffer();
+      const allCh     = pcmBytesToFloat32(ab, info.bitsPerSample, info.audioFmt);
+
+      if (info.channels === 1) {
+        mono = allCh;
+      } else {
+        // 複数チャンネル: ch0だけ抽出（インタリーブ解除）
+        mono = new Float32Array(Math.floor(allCh.length / info.channels));
+        for (let i = 0; i < mono.length; i++) mono[i] = allCh[i * info.channels];
+      }
+
+    } else {
+      // ── MP3/AAC: セグメント単位でdecodeAudioData ───────────────────────
+      // DECODE_SEG_SEC（15分）単位でデコードし、必要な5分チャンクを切り出す。
+      // セグメント境界の前後に余裕を持たせてデコードの信頼性を高める。
+      const segIdx      = Math.floor(chunkStartSec / DECODE_SEG_SEC);
+      const segStartSec = Math.max(0, segIdx * DECODE_SEG_SEC - DECODE_OVERLAP_SEC);
+      const segEndSec   = Math.min(analyzer.duration, (segIdx + 1) * DECODE_SEG_SEC + DECODE_OVERLAP_SEC);
+
+      const bytesPerSec = file.size / Math.max(1, analyzer.duration);
+
+      // デコード試行（失敗時は範囲を広げてリトライ）
+      let segBuf = null;
+      const attempts = [
+        { startSec: segStartSec, endSec: segEndSec },                           // 通常
+        { startSec: Math.max(0, segStartSec - 10), endSec: Math.min(file.size / bytesPerSec, segEndSec + 10) }, // ±10秒拡張
+        { startSec: 0, endSec: analyzer.duration },                             // 全体フォールバック（最終手段）
+      ];
+
+      for (let ai = 0; ai < attempts.length; ai++) {
+        const att = attempts[ai];
+        const startByte = Math.max(0, Math.floor(att.startSec * bytesPerSec));
+        const endByte   = Math.min(file.size, Math.ceil(att.endSec * bytesPerSec));
+
+        // ファイル全体フォールバックの場合メモリ消費が大きいので警告
+        if (ai === 2 && file.size > 500 * 1024 * 1024) {
+          logLine(`⚠ MP3/AAC: セグメントデコード失敗 → 全体デコードを試みます（メモリ注意: ${fmtBytes(file.size)}）`);
+        }
+
+        const ab = await file.slice(startByte, endByte).arrayBuffer();
+        try {
+          // AudioContextを使い回す（ブラウザのAudioContext数上限対策）
+          if (!_sharedDecodeCtx || _sharedDecodeCtx.state === 'closed') {
+            _sharedDecodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+          }
+          segBuf = await _sharedDecodeCtx.decodeAudioData(ab);
+          // 成功した場合、実際の開始時刻を記録
+          att._actualStartSec = att.startSec;
+          // segStartSecをこのattemptの値に更新（後の切り出しオフセット計算のため）
+          if (ai > 0) {
+            logLine(`MP3/AAC chunk#${chunkIdx}: デコード成功（試行${ai + 1}回目, 範囲${att.startSec.toFixed(0)}s-${att.endSec.toFixed(0)}s）`);
+          }
+          // segStartSecをattemptの実際の値に更新
+          var actualSegStartSec = att.startSec;
+          break;
+        } catch (decErr) {
+          if (ai < attempts.length - 1) continue; // 次の試行へ
+          throw new Error(`MP3/AACデコード失敗(chunk#${chunkIdx}): ${decErr?.message ?? decErr}`);
+        }
+      }
+      // actualSegStartSecが定義されていない場合（通常のパスで成功）
+      if (typeof actualSegStartSec === 'undefined') actualSegStartSec = segStartSec;
+
+      sr = segBuf.sampleRate;
+      const segData = segBuf.getChannelData(0);
+
+      // セグメント内の「このチャンク」に対応する部分を切り出す
+      const chunkInSegStart = Math.floor(Math.max(0, chunkStartSec - actualSegStartSec) * sr);
+      const chunkInSegEnd   = Math.min(segData.length, Math.ceil((Math.min(chunkEndSec, analyzer.duration) - actualSegStartSec) * sr));
+
+      mono = new Float32Array(Math.max(0, chunkInSegEnd - chunkInSegStart));
+      if (mono.length > 0) {
+        mono.set(segData.subarray(chunkInSegStart, chunkInSegEnd));
+      }
+    }
+
+    const chunk = { mono, sr, lastUsed: Date.now() };
+    audioChunkCache.set(chunkIdx, chunk);
+    pruneAudioChunks();
+    return chunk;
+  })();
+
+  _chunkInflight.set(chunkIdx, promise);
+  try {
+    return await promise;
+  } finally {
+    _chunkInflight.delete(chunkIdx);
+  }
+}
+
+// ── 公開API ──────────────────────────────────────────────────────────────
+
+/**
+ * 指定時間範囲のモノラルサンプルを返す。
+ * @returns {{ mono: Float32Array, sr: number }}
+ */
+async function getAudioSamples(startSec, endSec) {
+  if (!analyzer.file) throw new Error('ファイル未ロード');
+
+  // 新しいファイルに変わっていたらキャッシュ破棄
+  if (_audioChunkFile !== analyzer.file) {
+    clearAudioChunkCache();
+    _audioChunkFile = analyzer.file;
+  }
+
+  const firstChunkIdx = Math.floor(startSec / AUDIO_CHUNK_SEC);
+  const lastChunkIdx  = Math.floor(Math.max(startSec, endSec - 1e-9) / AUDIO_CHUNK_SEC);
+
+  if (firstChunkIdx === lastChunkIdx) {
+    // 典型ケース: 1チャンク内に収まる
+    const chunk = await fetchAudioChunk(firstChunkIdx, analyzer.file);
+    const sr    = chunk.sr;
+    const chunkStartSec = firstChunkIdx * AUDIO_CHUNK_SEC;
+    const s = Math.max(0, Math.floor((startSec - chunkStartSec) * sr));
+    const e = Math.min(chunk.mono.length, Math.ceil((endSec - chunkStartSec) * sr));
+    return { mono: chunk.mono.subarray(s, e), sr };
+  }
+
+  // チャンク境界をまたぐ場合: コピーして結合
+  const firstChunk = await fetchAudioChunk(firstChunkIdx, analyzer.file);
+  const sr         = firstChunk.sr;
+  const totalLen   = Math.ceil((endSec - startSec) * sr);
+  const result     = new Float32Array(totalLen);
+  let   written    = 0;
+
+  for (let ci = firstChunkIdx; ci <= lastChunkIdx && written < totalLen; ci++) {
+    const chunk = await fetchAudioChunk(ci, analyzer.file);
+    const chunkStartSec = ci * AUDIO_CHUNK_SEC;
+    const chunkEndSec   = chunkStartSec + AUDIO_CHUNK_SEC;
+    const s = Math.max(0, Math.floor((startSec - chunkStartSec) * sr));
+    const e = Math.min(chunk.mono.length, Math.ceil((Math.min(endSec, chunkEndSec) - chunkStartSec) * sr));
+    const slice   = chunk.mono.subarray(s, e);
+    const copyLen = Math.min(slice.length, totalLen - written);
+    result.set(slice.subarray(0, copyLen), written);
+    written += copyLen;
+  }
+
+  return { mono: result.subarray(0, written), sr };
+}
+
+// スキャン開始時にファイル情報を事前確認するだけ（実際のデコードは getAudioSamples で遅延実行）
+async function ensureAudioDecoded() {
+  if (!analyzer.file) throw new Error('ファイル未ロード');
+  if (_audioChunkFile !== analyzer.file) {
+    clearAudioChunkCache();
+    _audioChunkFile = analyzer.file;
+  }
+  // WAVの場合はヘッダーだけ事前パース（512バイト読むだけ・瞬時）
+  if (isWavFile(analyzer.file) && !_wavInfo) {
+    _wavInfo = await parseWavHeader(analyzer.file);
+    logLine(`WAV: ${_wavInfo.sampleRate}Hz ${_wavInfo.channels}ch ${_wavInfo.bitsPerSample}bit / ${(_wavInfo.duration/3600).toFixed(2)}時間`);
+  }
+}
+
+// 後方互換ラッパー（呼び出し箇所がまだあれば動くように）
+async function getFullAudioBuffer() {
+  const dur = analyzer.duration || 1;
+  const { mono, sr } = await getAudioSamples(0, dur);
+  return { sampleRate: sr, getChannelData: () => mono, length: mono.length, duration: dur, numberOfChannels: 1 };
+}
+
 
 /** ===================== Tile cache (LRU) ===================== */
 const tileCache = new Map();
@@ -330,10 +634,10 @@ function hzToY(hz, cfg, plotH) {
 }
 
 function drawAxis(ctx, cfg, plotH) {
-  ctx.fillStyle = '#f7f7f7';
+  ctx.fillStyle = '#111827';
   ctx.fillRect(0,0,AXIS_W,UI.specCanvas.height);
 
-  ctx.strokeStyle = 'rgba(0,0,0,.08)';
+  ctx.strokeStyle = 'rgba(255,255,255,.12)';
   ctx.beginPath();
   ctx.moveTo(AXIS_W + 0.5, 0);
   ctx.lineTo(AXIS_W + 0.5, UI.specCanvas.height);
@@ -342,9 +646,9 @@ function drawAxis(ctx, cfg, plotH) {
   const range = cfg.maxHz - cfg.minHz;
   const step = (range <= 6000) ? 500 : 1000;
 
-  ctx.fillStyle = 'rgba(0,0,0,.70)';
+  ctx.fillStyle = 'rgba(200,210,230,.85)';
   ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
-  ctx.strokeStyle = `rgba(0,0,0,${GRID_ALPHA})`;
+  ctx.strokeStyle = `rgba(255,255,255,${GRID_ALPHA})`;
   ctx.lineWidth = 1;
 
   for (let hz = Math.ceil(cfg.minHz/step)*step; hz <= cfg.maxHz; hz += step) {
@@ -358,7 +662,7 @@ function drawAxis(ctx, cfg, plotH) {
     ctx.fillText(`${khz}`, 10, y + 4);
   }
 
-  ctx.fillStyle = 'rgba(0,0,0,.55)';
+  ctx.fillStyle = 'rgba(150,165,200,.7)';
   ctx.fillText('kHz', 10, 16);
 }
 
@@ -368,7 +672,7 @@ function drawTimeTopGrid(ctx, cfg, viewStartSec, viewEndSec) {
   const step = (spanSec <= 20) ? 1 : (spanSec <= 120 ? 5 : 10);
 
   ctx.save();
-  ctx.strokeStyle = `rgba(0,0,0,${GRID_ALPHA})`;
+  ctx.strokeStyle = `rgba(255,255,255,${GRID_ALPHA})`;
   ctx.lineWidth = 1;
 
   const first = Math.floor(viewStartSec/step)*step;
@@ -382,7 +686,7 @@ function drawTimeTopGrid(ctx, cfg, viewStartSec, viewEndSec) {
   ctx.restore();
 
   ctx.save();
-  ctx.fillStyle = 'rgba(0,0,0,.60)';
+  ctx.fillStyle = 'rgba(200,210,230,.80)';
   ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
   for (let t=first; t<=viewEndSec; t+=step){
     const x = plotX0 + (t - viewStartSec) * cfg.pxPerSec;
@@ -422,12 +726,10 @@ function drawPlayhead(ctx, cfg, viewStartSec, currentTimeSec) {
 /** ===================== Tile generation ===================== */
 let abortCtrl = null;
 
-// fixed tile bitmap height (gives bird-friendly resolution)
 const TILE_H = 512;
 
 function yToHzByScale(y, cfg, plotH){
-  // y: 0..(TILE_H-1) inside tile image; map to freq
-  const t = 1 - (y / Math.max(1, (plotH - 1))); // 0 bottom -> min, 1 top -> max
+  const t = 1 - (y / Math.max(1, (plotH - 1)));
   const minHz = Math.max(1, cfg.minHz);
   const maxHz = Math.max(minHz+1, cfg.maxHz);
   if (cfg.freqScale === 'log'){
@@ -439,107 +741,115 @@ function yToHzByScale(y, cfg, plotH){
 }
 
 async function generateTileBitmap(tileIndex, cfg, abortSignal) {
-  const tileStart = tileIndex * cfg.tileSec;
-  const tileEnd = Math.min(analyzer.duration, tileStart + cfg.tileSec);
+  const tileStart     = tileIndex * cfg.tileSec;
+  const tileEnd       = Math.min(analyzer.duration, tileStart + cfg.tileSec);
   const targetSeconds = tileEnd - tileStart;
 
-  analyzer.analyser.fftSize = cfg.fftSize;
-  analyzer.analyser.smoothingTimeConstant = 0;
-  analyzer.analyser.minDecibels = cfg.minDb;
-  analyzer.analyser.maxDecibels = cfg.maxDb;
+  if (!analyzer.file) throw new Error('ファイル未ロード');
+  if (abortSignal?.aborted) throw new Error('abort');
 
-  const bins = analyzer.analyser.frequencyBinCount;
-  const tmp = new Float32Array(bins);
-  const binHz = analyzer.audioCtx.sampleRate / cfg.fftSize;
+  // ── ファイル全体のデコード済みバッファを取得（MP3/AACのバイトスライス問題を回避）──
+  if (abortSignal?.aborted) throw new Error('abort');
+  const { mono, sr } = await getAudioSamples(tileStart, tileEnd);
+  if (abortSignal?.aborted) throw new Error('abort');
 
-  const hopMs = 1000 / cfg.fps;
-  const width = Math.max(1, Math.floor(targetSeconds * cfg.fps));
-  const height = TILE_H;
+  {  // ブロックスコープ（try/finallyを削除しシンプルに）
 
-  const oc = (typeof OffscreenCanvas !== 'undefined')
-    ? new OffscreenCanvas(width, height)
-    : (() => { const c = document.createElement('canvas'); c.width=width; c.height=height; return c; })();
+    // ── FFT 準備 ───────────────────────────────────────────────────────
+    const FFT_N   = clamp(nextPow2(cfg.fftSize), 512, 4096);
+    const halfFFT = (FFT_N >> 1) - 1;
+    const plan    = makeFft(FFT_N);
+    const re      = new Float32Array(FFT_N);
+    const im      = new Float32Array(FFT_N);
+    const binHz   = sr / FFT_N;
 
-  const ctx = oc.getContext('2d', { willReadFrequently:false });
-  const img = ctx.createImageData(width, height);
-  const data = img.data;
-
-  const invRange = 1.0 / Math.max(1e-6, (cfg.maxDb - cfg.minDb));
-
-  let stop = false;
-  const onAbort = () => { stop = true; };
-  abortSignal?.addEventListener('abort', onAbort, { once:true });
-
-  try {
-    analyzer.audio.currentTime = Math.max(0, tileStart);
-    await sleep(90);
-    try { await analyzer.audio.play(); } catch (e) { /* Chrome autoplay guard */ }
-
-    const startT = nowMs();
-    let nextSample = startT;
-    let x = 0;
-    let lastCol = null;
-
-    while (!stop) {
-      const now = nowMs();
-      const elapsed = (now - startT)/1000;
-      if (elapsed >= targetSeconds) break;
-      if (x >= width) break;
-
-      if (now >= nextSample) {
-        analyzer.analyser.getFloatFrequencyData(tmp);
-
-        // Build one column directly into ImageData
-        for (let y=0; y<height; y++){
-          const hz = yToHzByScale(y, cfg, height);
-          const bin = clamp(Math.round(hz / binHz), 0, bins-1);
-          const db = tmp[bin];
-          const norm = clamp((db - cfg.minDb) * invRange, 0, 1); // 0..1
-          const [r,g,b] = mapColor(cfg.colorMap, norm);
-          const idx = (y * width + x) * 4;
-          data[idx+0] = r;
-          data[idx+1] = g;
-          data[idx+2] = b;
-          data[idx+3] = 255;
-        }
-
-        lastCol = x;
-        x++;
-        nextSample += hopMs;
-      }
-      await sleep(6);
+    // LUT 1: Hann窓
+    const hannLUT = new Float32Array(FFT_N);
+    for (let n = 0; n < FFT_N; n++) {
+      hannLUT[n] = 0.5 * (1.0 - Math.cos((2 * Math.PI * n) / (FFT_N - 1)));
     }
 
-    analyzer.audio.pause();
-
-    // If we sampled less than width, extend last column to the right (avoid blank tail)
-    if (lastCol !== null && lastCol < width-1) {
-      for (let fillX = lastCol+1; fillX < width; fillX++){
-        for (let y=0; y<height; y++){
-          const src = (y * width + lastCol) * 4;
-          const dst = (y * width + fillX) * 4;
-          data[dst+0]=data[src+0];
-          data[dst+1]=data[src+1];
-          data[dst+2]=data[src+2];
-          data[dst+3]=255;
-        }
-      }
+    // LUT 2: y座標 → FFT bin
+    const height = TILE_H;
+    const binLUT = new Int32Array(height);
+    for (let y = 0; y < height; y++) {
+      binLUT[y] = clamp(Math.round(yToHzByScale(y, cfg, height) / binHz), 0, halfFFT);
     }
 
-    ctx.putImageData(img, 0, 0);
+    // LUT 3: カラーパレット
+    const CLUT_N   = 1024;
+    const CLUT_MAX = CLUT_N - 1;
+    const colorLUT = new Uint8Array(CLUT_N * 3);
+    for (let i = 0; i < CLUT_N; i++) {
+      const [r, g, b] = mapColor(cfg.colorMap, i / CLUT_MAX);
+      colorLUT[i * 3] = r; colorLUT[i * 3 + 1] = g; colorLUT[i * 3 + 2] = b;
+    }
+
+    // ── キャンバス準備 ──────────────────────────────────────────────────
+    const samplesPerCol = Math.max(1, Math.floor(sr / cfg.fps));
+    const width         = Math.max(1, Math.floor(targetSeconds * cfg.fps));
+
+    const oc = (typeof OffscreenCanvas !== 'undefined')
+      ? new OffscreenCanvas(width, height)
+      : (() => { const c = document.createElement('canvas'); c.width=width; c.height=height; return c; })();
+
+    const ctx     = oc.getContext('2d', { willReadFrequently: false });
+    const imgData = ctx.createImageData(width, height);
+    const data    = imgData.data;
+
+    // dB正規化定数（Web Audio AnalyserNode に合わせる）
+    const LOG10_SCALE = 10.0 / Math.LN10;
+    const invRange    = 1.0 / Math.max(1e-6, cfg.maxDb - cfg.minDb);
+    const minDb       = cfg.minDb;
+    const normDb      = -20.0 * Math.log10(FFT_N); // Chromium: scaler=1/N → -20*log10(N)
+
+    for (let i = 3; i < data.length; i += 4) data[i] = 255;
+
+    const stride = width * 4;
+
+    for (let x = 0; x < width; x++) {
+      if (abortSignal?.aborted) throw new Error('abort');
+
+      const sampleStart = x * samplesPerCol;
+      const xBase       = x * 4;
+
+      if (sampleStart + FFT_N > mono.length) {
+        if (x > 0) {
+          const prev = (x - 1) * 4;
+          for (let y = 0; y < height; y++) {
+            const row = y * stride;
+            data[row + xBase]     = data[row + prev];
+            data[row + xBase + 1] = data[row + prev + 1];
+            data[row + xBase + 2] = data[row + prev + 2];
+          }
+        }
+        continue;
+      }
+
+      for (let n = 0; n < FFT_N; n++) {
+        re[n] = mono[sampleStart + n] * hannLUT[n];
+        im[n] = 0;
+      }
+      fftInPlace(re, im, plan);
+
+      for (let y = 0; y < height; y++) {
+        const bin = binLUT[y];
+        const rr  = re[bin], ii = im[bin];
+        const db  = LOG10_SCALE * Math.log(rr * rr + ii * ii + 1e-12) + normDb;
+        const ci  = clamp(((db - minDb) * invRange * CLUT_MAX + 0.5) | 0, 0, CLUT_MAX) * 3;
+        const idx = y * stride + xBase;
+        data[idx]     = colorLUT[ci];
+        data[idx + 1] = colorLUT[ci + 1];
+        data[idx + 2] = colorLUT[ci + 2];
+      }
+
+      if ((x & 63) === 63) await sleep(0);
+    }
+
+    ctx.putImageData(imgData, 0, 0);
     const bitmap = await createImageBitmap(oc);
-    return {
-      bitmap,
-      width,
-      height,
-      tileIndex,
-      tileStart,
-      tileSec: cfg.tileSec,
-      lastUsed: nowMs()
-    };
-  } finally {
-    abortSignal?.removeEventListener('abort', onAbort);
-    try { analyzer.audio.pause(); } catch {}
+    return { bitmap, width, height, tileIndex, tileStart, tileSec: cfg.tileSec, lastUsed: nowMs() };
+
   }
 }
 
@@ -582,7 +892,7 @@ async function ensureTilesForRange(cfg, range) {
     const hit = tileCache.get(key);
     if (hit) { hit.lastUsed = nowMs(); continue; }
     if (tileInFlight.has(key)) continue;
-    if (tileInFlight.size >= 2) continue;
+    if (tileInFlight.size >= 3) continue;
 
     tileInFlight.add(key);
     (async () => {
@@ -605,28 +915,23 @@ function renderViewport(targetCanvas) {
 
   const cfg = getConfig();
 
-  // ensure canvas size matches viewport (for main canvas only)
   if (targetCanvas === UI.specCanvas) resizeCanvasToViewport();
 
   const ctx = targetCanvas.getContext('2d', { alpha:false, willReadFrequently:false });
-  ctx.fillStyle = '#ffffff';
+  ctx.fillStyle = '#0b0f1c';
   ctx.fillRect(0,0,targetCanvas.width, targetCanvas.height);
 
   const plotH = Math.max(1, targetCanvas.height - PAD_T - PAD_B);
   const range = getVisibleTimeRange(cfg);
   if (targetCanvas === UI.specCanvas) updateLabels(range);
 
-  // axis + grids
   drawAxis(ctx, cfg, plotH);
   drawTimeTopGrid(ctx, cfg, range.startSec, range.endSec);
 
-  // optional highlight
   drawBandHighlight(ctx, cfg, plotH);
 
-  // tiles needed
   ensureTilesForRange(cfg, range);
 
-  // draw tiles intersecting
   const startIdx = Math.floor(range.startSec / cfg.tileSec);
   const endIdx = Math.floor(range.endSec / cfg.tileSec);
   const plotX0 = AXIS_W;
@@ -643,7 +948,6 @@ function renderViewport(targetCanvas) {
     const drawEnd = Math.min(range.endSec, tileEnd);
     if (drawEnd <= drawStart) continue;
 
-    // src in tile bitmap: width = tileSec * fps
     const srcX0 = (drawStart - tileStart) * cfg.fps;
     const srcX1 = (drawEnd - tileStart) * cfg.fps;
     const srcW = Math.max(1, srcX1 - srcX0);
@@ -658,11 +962,9 @@ function renderViewport(targetCanvas) {
     );
   }
 
-  // playhead
   const t = UI.fullAudio.currentTime || 0;
   drawPlayhead(ctx, cfg, range.startSec, t);
 
-  // progress bar
   if (analyzer.duration > 0 && targetCanvas === UI.specCanvas) {
     const p = clamp(t / analyzer.duration, 0, 1);
     UI.barFill.style.width = `${(p*100).toFixed(1)}%`;
@@ -695,13 +997,37 @@ function stopPlayheadLoop() {
   if (playingRaf) { cancelAnimationFrame(playingRaf); playingRaf = 0; }
 }
 
+// 再生リクエストの連番管理（連打・競合防止）
+let _playSeq = 0;
+
 async function playFrom(timeSec) {
   if (!analyzer.inited) return;
+
+  // 新しいリクエストの番号を確保
+  const seq = ++_playSeq;
+
+  // ① 先に必ず一時停止してから seek（play/pause 競合を防ぐ）
+  try { UI.fullAudio.pause(); } catch {}
   UI.fullAudio.style.display = 'block';
   UI.fullAudio.currentTime = clamp(timeSec, 0, analyzer.duration);
-  await sleep(40);
-  try { await UI.fullAudio.play(); }
-  catch (e) { logLine(`再生失敗: ${e?.message ?? e}`); return; }
+
+  // ② 1フレーム分だけ待って currentTime を確定させる
+  await sleep(0);
+
+  // 自分より新しいリクエストが来ていたら何もしない
+  if (seq !== _playSeq) return;
+
+  try {
+    await UI.fullAudio.play();
+  } catch (e) {
+    // AbortError はブラウザが連続 play() を中断しただけなので無視
+    if (e?.name === 'AbortError') return;
+    logLine(`再生失敗: ${e?.message ?? e}`);
+    return;
+  }
+
+  if (seq !== _playSeq) { try { UI.fullAudio.pause(); } catch {} return; }
+
   startPlayheadLoop();
   scheduleRender();
 }
@@ -712,7 +1038,6 @@ async function exportVisiblePNG() {
   setState('PNG作成中');
   UI.exportViewBtn.disabled = true;
   try {
-    // Render to offscreen at same resolution as current canvas
     const w = UI.specCanvas.width;
     const h = UI.specCanvas.height;
 
@@ -720,7 +1045,6 @@ async function exportVisiblePNG() {
       ? new OffscreenCanvas(w, h)
       : (() => { const c=document.createElement('canvas'); c.width=w; c.height=h; return c; })();
 
-    // Important: we render the current view (based on viewport scroll)
     renderViewport(oc);
 
     const blob = await (oc.convertToBlob ? oc.convertToBlob({ type:'image/png' }) : new Promise(r => oc.toBlob(r, 'image/png')));
@@ -752,6 +1076,13 @@ function clearAll() {
   analyzer.file = null;
   analyzer.inited = false;
   analyzer.duration = 0;
+  clearAudioChunkCache();
+
+  // MP3/AAC用共有AudioContextをクリーンアップ
+  if (_sharedDecodeCtx) {
+    try { _sharedDecodeCtx.close(); } catch {}
+    _sharedDecodeCtx = null;
+  }
 
   UI.log.textContent = '';
   UI.barFill.style.width = '0%';
@@ -766,14 +1097,16 @@ function clearAll() {
   UI.pauseBtn.disabled = true;
   UI.stopBtn.disabled = true;
   UI.exportViewBtn.disabled = true;
+  UI.exportAllBtn.disabled = true;
+  UI.exportProgress.textContent = '';
+  UI.exportProgress.className = '';
 
   UI.spacer.style.width = '0px';
   UI.viewport.scrollLeft = 0;
 
-  // clear canvas
   resizeCanvasToViewport();
   const ctx = UI.specCanvas.getContext('2d', { alpha:false });
-  ctx.fillStyle = '#ffffff';
+  ctx.fillStyle = '#0b0f1c';
   ctx.fillRect(0,0,UI.specCanvas.width, UI.specCanvas.height);
 }
 
@@ -805,15 +1138,10 @@ UI.prepareBtn.addEventListener('click', async () => {
     UI.durLabel.textContent = `${duration.toFixed(2)}s`;
 
     await initAnalyzerForFile(file);
-  if (analyzer.audioCtx && analyzer.audioCtx.state === 'suspended') {
-    try { await analyzer.audioCtx.resume(); } catch(e){}
-  }
-
 
     const cfg = getConfig();
     const totalW = Math.max(1, Math.floor(duration * cfg.pxPerSec));
     UI.spacer.style.width = `${totalW}px`;
-    UI.spacer.style.height = '100%';
     UI.viewport.scrollLeft = 0;
 
     UI.playBtn.disabled = false;
@@ -852,7 +1180,6 @@ UI.stopBtn.addEventListener('click', () => {
 UI.viewport.addEventListener('scroll', () => scheduleRender());
 window.addEventListener('resize', () => scheduleRender());
 
-// click-to-seek
 UI.specCanvas.addEventListener('click', async (ev) => {
   if (!analyzer.inited) return;
   const cfg = getConfig();
@@ -863,7 +1190,6 @@ UI.specCanvas.addEventListener('click', async (ev) => {
   await playFrom(time);
 });
 
-// settings change -> rerender + spacer update (zoom)
 function onSettingChanged() {
   if (!analyzer.inited) { scheduleRender(); return; }
   const cfg = getConfig();
@@ -909,6 +1235,15 @@ function fmtHMS(sec){
   return `${hh}:${mm}:${ss}`;
 }
 
+/** ファイル名用タイムスタンプ: h-mm-ss （例: 0-03-21） */
+function fmtFileTime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return `${h}-${String(m).padStart(2,'0')}-${String(s).padStart(2,'0')}`;
+}
+
 function setScanProgress(pct){
   const v = clamp(pct, 0, 100);
   UI.scanPct.textContent = `${v.toFixed(0)}%`;
@@ -917,17 +1252,23 @@ function setScanProgress(pct){
 
 function clearDetectList(){
   UI.detectList.innerHTML = '';
+  UI.exportAllBtn.disabled = true;
+  UI.exportProgress.textContent = '';
+  UI.exportProgress.className = '';
 }
 
 function addDetectButton(sec){
   const btn = document.createElement('button');
   btn.textContent = fmtHMS(sec);
   btn.className = 'mono';
+  btn.dataset.sec = String(sec);
   btn.addEventListener('click', async () => {
     if (!analyzer.inited) return;
     await playFrom(sec);
   });
   UI.detectList.appendChild(btn);
+  // 1件以上検出されたら全件出力ボタンを有効化
+  UI.exportAllBtn.disabled = false;
 }
 
 function wireScanSliders(){
@@ -951,18 +1292,15 @@ function wireScanSliders(){
     UI.scanMaxHz.value = String(max);
     UI.scanThreshold.value = String(thr);
 
-    // number inputs
     if (UI.scanMinHzVal) UI.scanMinHzVal.value = String(min);
     if (UI.scanMaxHzVal) UI.scanMaxHzVal.value = String(max);
     if (UI.scanThresholdVal) UI.scanThresholdVal.value = String(thr);
   };
 
-  // range -> number
   UI.scanMinHz.addEventListener('input', syncAll);
   UI.scanMaxHz.addEventListener('input', syncAll);
   UI.scanThreshold.addEventListener('input', syncAll);
 
-  // number -> range
   UI.scanMinHzVal?.addEventListener('input', () => {
     const v = parseInt(UI.scanMinHzVal.value,10);
     if (!Number.isFinite(v)) return;
@@ -982,7 +1320,6 @@ function wireScanSliders(){
     syncAll();
   });
 
-  // presets (min/max Hz, segSec, thrDelta dB)
   const setPreset = (min, max, segSec, thrDelta) => {
     UI.scanMinHz.value = String(min);
     UI.scanMaxHz.value = String(max);
@@ -994,7 +1331,6 @@ function wireScanSliders(){
   UI.presetOwl?.addEventListener('click', () => setPreset(400, 1200, 3.0, 10));
   UI.presetTora?.addEventListener('click', () => setPreset(2000, 2800, 1.0, 15));
 
-  // seg sec clamp
   UI.scanSegSec?.addEventListener('input', () => {
     const v = parseFloat(UI.scanSegSec.value);
     if (!Number.isFinite(v)) return;
@@ -1004,60 +1340,7 @@ function wireScanSliders(){
   syncAll();
 }
 
-async function readWavHeader(file){
-  // Read first 256KB for safety (chunks may extend)
-  const headBuf = await file.slice(0, Math.min(file.size, 262144)).arrayBuffer();
-  const dv = new DataView(headBuf);
-  const u8 = new Uint8Array(headBuf);
-
-  const str = (off, len) => {
-    let s = '';
-    for (let i=0;i<len;i++) s += String.fromCharCode(u8[off+i]||0);
-    return s;
-  };
-
-  if (str(0,4) !== 'RIFF' || str(8,4) !== 'WAVE') {
-    throw new Error('WAV(RIFF/WAVE)ではありません');
-  }
-
-  let fmt = null;
-  let data = null;
-
-  let off = 12;
-  while (off + 8 <= dv.byteLength) {
-    const id = str(off,4);
-    const size = dv.getUint32(off+4, true);
-    const chunkDataOff = off + 8;
-    if (id === 'fmt ') {
-      if (chunkDataOff + 16 > dv.byteLength) break;
-      const audioFormat = dv.getUint16(chunkDataOff+0, true); // 1=PCM, 3=float
-      const numChannels = dv.getUint16(chunkDataOff+2, true);
-      const sampleRate = dv.getUint32(chunkDataOff+4, true);
-      const byteRate = dv.getUint32(chunkDataOff+8, true);
-      const blockAlign = dv.getUint16(chunkDataOff+12, true);
-      const bitsPerSample = dv.getUint16(chunkDataOff+14, true);
-      fmt = { audioFormat, numChannels, sampleRate, byteRate, blockAlign, bitsPerSample };
-    } else if (id === 'data') {
-      data = { dataOffset: chunkDataOff, dataSize: size };
-      break; // usually last; we can stop
-    }
-    off = chunkDataOff + size + (size % 2); // word aligned
-  }
-
-  if (!fmt || !data) throw new Error('WAVヘッダ解析に失敗（fmt/dataが見つかりません）');
-
-  const bytesPerSample = fmt.bitsPerSample / 8;
-  if (![1,3].includes(fmt.audioFormat)) throw new Error(`未対応WAV形式 audioFormat=${fmt.audioFormat}（PCM=1/Float=3のみ）`);
-  if (![16, 32].includes(fmt.bitsPerSample)) throw new Error(`bitsPerSample=${fmt.bitsPerSample} 未対応（16/32のみ）`);
-  if (!Number.isFinite(data.dataSize) || data.dataSize <= 0) throw new Error('dataSize不正');
-
-  return {
-    ...fmt,
-    ...data,
-    bytesPerSample,
-    totalSamples: Math.floor(data.dataSize / fmt.blockAlign)
-  };
-}
+// readWavHeader は parseWavHeader に統合済み（削除）
 
 function makeFft(fftSize){
   const N = fftSize;
@@ -1068,7 +1351,6 @@ function makeFft(fftSize){
     for (let b=0;b<logN;b++){ y = (y<<1) | (x & 1); x >>= 1; }
     rev[i]=y;
   }
-  // twiddles per stage
   const cos = new Float32Array(N/2);
   const sin = new Float32Array(N/2);
   for (let k=0;k<N/2;k++){
@@ -1114,29 +1396,7 @@ function hannWindow(n, N){
   return 0.5*(1 - Math.cos(2*Math.PI*n/(N-1)));
 }
 
-function decodePcmMono(buffer, header){
-  const dv = new DataView(buffer);
-  const {numChannels, bitsPerSample, audioFormat, bytesPerSample} = header;
-  const frames = Math.floor(dv.byteLength / (numChannels*bytesPerSample));
-  const mono = new Float32Array(frames);
-  const isFloat = (audioFormat === 3 && bitsPerSample === 32);
-
-  let off = 0;
-  for (let i=0;i<frames;i++){
-    let sum = 0;
-    for (let ch=0; ch<numChannels; ch++){
-      if (isFloat){
-        sum += dv.getFloat32(off, true);
-      } else {
-        // 16-bit PCM
-        sum += dv.getInt16(off, true) / 32768;
-      }
-      off += bytesPerSample;
-    }
-    mono[i] = sum / numChannels;
-  }
-  return mono;
-}
+// decodePcmMono は pcmBytesToFloat32 に統合済み（削除）
 
 
 function getScanSegSec(){
@@ -1145,166 +1405,12 @@ function getScanSegSec(){
   return clamp(seg, 0.5, 10.0);
 }
 
-async function scanBandWav(file){
-  const SEG_SEC = getScanSegSec();
-
-  setState('スキャン中');
-  UI.scanBtn.disabled = true;
-  UI.scanAbortBtn.disabled = false;
-  clearDetectList();
-  setScanProgress(0);
-
-  scanAbortCtrl = new AbortController();
-  const sig = scanAbortCtrl.signal;
-
-  const header = await readWavHeader(file);
-  const bytesPerSec = header.sampleRate * header.blockAlign;
-  const segBytes = Math.max(1, Math.floor(bytesPerSec * SEG_SEC));
-  const totalSeg = Math.ceil(header.dataSize / segBytes);
-
-  const FFT_N = 2048;
-  const plan = makeFft(FFT_N);
-  const re = new Float32Array(FFT_N);
-  const im = new Float32Array(FFT_N);
-
-  const minHz = clamp(parseInt(UI.scanMinHz.value,10)||0, 0, header.sampleRate/2);
-  const maxHz = clamp(parseInt(UI.scanMaxHz.value,10)||0, 0, header.sampleRate/2);
-  const thrDeltaDb = clamp(parseInt(UI.scanThreshold.value,10)||15, 0, 40);
-  const lo = Math.min(minHz, maxHz);
-  const hi = Math.max(minHz, maxHz);
-
-  const binHz = header.sampleRate / FFT_N;
-  const minBin = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
-  const maxBin = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
-  const bins = Math.max(1, (maxBin - minBin + 1));
-
-  // ---- noise learn (per-bin baseline dB) ----
-  let baselineDb = new Float32Array(bins);
-  baselineDb.fill(-120);
-
-  try{
-    const ns = parseFloat(UI.noiseStartSec?.value ?? '5');
-    const ne = parseFloat(UI.noiseEndSec?.value ?? '7');
-    let startSec = Number.isFinite(ns) ? ns : 5;
-    let endSec = Number.isFinite(ne) ? ne : 7;
-    startSec = Math.max(0, startSec);
-    endSec = Math.max(0, endSec);
-    if (endSec < startSec) { const t=startSec; startSec=endSec; endSec=t; }
-    if (endSec - startSec < 0.2) endSec = startSec + 0.2;
-
-    const startByte = header.dataOffset + Math.floor(startSec * bytesPerSec);
-    const endByte = Math.min(header.dataOffset + header.dataSize, header.dataOffset + Math.floor(endSec * bytesPerSec));
-    const nab = await file.slice(startByte, endByte).arrayBuffer();
-    const monoN = decodePcmMono(nab, header);
-
-    const hopN = FFT_N >> 1;
-    const acc = new Float64Array(bins);
-    let framesN = 0;
-
-    for (let i=0; i + FFT_N <= monoN.length; i += hopN){
-      for (let n=0;n<FFT_N;n++){
-        re[n] = monoN[i+n] * hannWindow(n, FFT_N);
-        im[n] = 0;
-      }
-      fftInPlace(re, im, plan);
-      for (let b=minBin; b<=maxBin; b++){
-        const rr = re[b], ii = im[b];
-        acc[b-minBin] += rr*rr + ii*ii;
-      }
-      framesN++;
-    }
-
-    if (framesN > 0){
-      for (let k=0;k<bins;k++){
-        const meanPow = acc[k] / framesN;
-        baselineDb[k] = 10 * Math.log10(meanPow + 1e-12);
-      }
-      // display: use median-ish (sorted mid) for logging
-      const tmpArr = Array.from(baselineDb);
-      tmpArr.sort((a,b)=>a-b);
-      const mid = tmpArr[Math.floor(tmpArr.length*0.5)];
-      logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / baseline≈${mid.toFixed(1)} dB (per-bin)`);
-    } else {
-      logLine('ノイズ学習: フレーム不足（baseline=-120dB扱い）');
-    }
-  } catch(e){
-    logLine(`ノイズ学習失敗（継続）: ${e?.message ?? e}`);
-    baselineDb.fill(-120);
-  }
-
-  logLine(`スキャン開始: WAV ${header.sampleRate}Hz ch=${header.numChannels} bits=${header.bitsPerSample} / SEG=${SEG_SEC.toFixed(2)}s / FFT=${FFT_N}`);
-  logLine(`帯域: ${lo}..${hi} Hz / 検出感度(差分): +${thrDeltaDb} dB`);
-  logLine(`判定: SEG内で1フレームでも max( frameDb(bin) - baselineDb(bin) ) > +thr`);
-
-  let lastDetectedBucket = -9999;
-
-  for (let seg=0; seg<totalSeg; seg++){
-    if (sig.aborted) throw new Error('スキャン中断');
-
-    const startByte = seg * segBytes;
-    const endByte = Math.min(header.dataSize, startByte + segBytes);
-    const sliceStart = header.dataOffset + startByte;
-    const sliceEnd = header.dataOffset + endByte;
-
-    const secAt = (startByte / bytesPerSec);
-
-    let mono;
-    try{
-      const ab = await file.slice(sliceStart, sliceEnd).arrayBuffer();
-      mono = decodePcmMono(ab, header);
-    } catch(e){
-      // decode error -> skip
-      logLine(`seg#${seg} decode失敗（スキップ）: ${e?.message ?? e}`);
-      setScanProgress((seg+1)/totalSeg*100);
-      await sleep(0);
-      continue;
-    }
-
-    const hop = FFT_N >> 1;
-    let detected = false;
-
-    for (let i=0; i + FFT_N <= mono.length; i += hop){
-      for (let n=0;n<FFT_N;n++){
-        re[n] = mono[i+n] * hannWindow(n, FFT_N);
-        im[n] = 0;
-      }
-      fftInPlace(re, im, plan);
-
-      let maxDiffDb = -9999;
-      for (let b=minBin; b<=maxBin; b++){
-        const rr = re[b], ii = im[b];
-        const pow = rr*rr + ii*ii;
-        const frameDb = 10 * Math.log10(pow + 1e-12);
-        const diff = frameDb - baselineDb[b-minBin];
-        if (diff > maxDiffDb) maxDiffDb = diff;
-      }
-
-      if (maxDiffDb >= thrDeltaDb) { detected = true; break; }
-      if (sig.aborted) throw new Error('スキャン中断');
-    }
-
-    if (detected){
-      const bucket = Math.floor(secAt / SEG_SEC);
-      if (bucket !== lastDetectedBucket){
-        addDetectButton(secAt);
-        lastDetectedBucket = bucket;
-      }
-    }
-
-    setScanProgress((seg+1)/totalSeg*100);
-    if (seg % 8 === 0) await sleep(0);
-  }
-
-  logLine('スキャン完了');
-  setState('準備完了');
-  UI.scanAbortBtn.disabled = true;
-}
+// scanBandWav は scanBandDecode に統合済み（削除）
+// WAVファイルもチャンクキャッシュ経由の scanBandDecode で処理される
 
 
 async function scanBandDecode(file){
-  // MP3/AAC/OGG等: slice → decodeAudioData → FFT判定（境界デコード失敗はスキップして継続）
   const SEG_SEC = getScanSegSec();
-  const OVERLAP_SEC = 0.25;
 
   setState('スキャン中');
   UI.scanBtn.disabled = true;
@@ -1320,10 +1426,6 @@ async function scanBandDecode(file){
 
   const totalSeg = Math.ceil(duration / SEG_SEC);
 
-  const bytesPerSecEst = file.size / duration;
-  const segBytes = Math.max(256*1024, Math.floor(bytesPerSecEst * SEG_SEC));
-  const overlapBytes = Math.floor(bytesPerSecEst * OVERLAP_SEC);
-
   const FFT_N = 2048;
   const plan = makeFft(FFT_N);
   const re = new Float32Array(FFT_N);
@@ -1335,152 +1437,102 @@ async function scanBandDecode(file){
   const lo = Math.min(minHz, maxHz);
   const hi = Math.max(minHz, maxHz);
 
-  if (!analyzer.audioCtx) analyzer.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const audioCtx = analyzer.audioCtx;
-  if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch {} }
+  // ── 音声初期化（WAVはヘッダーのみ読む・MP3/AACは最初のチャンク取得時にデコード）─
+  await ensureAudioDecoded();
+  if (sig.aborted) throw new Error('スキャン中断');
 
-  // ---- noise learn (decode / per-bin baseline dB) ----
+  // srはチャンク0を実際に取得して確認（ノイズ区間より前に取得しておく）
+  const _chunk0 = await fetchAudioChunk(0, analyzer.file);
+  const sr    = _chunk0.sr;
+  const binHz = sr / FFT_N;
+  const minBin = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
+  const maxBin = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
+
+  // ── ノイズベースライン学習 ────────────────────────────────────────────
   let baselineDb = null;
-  let baselineSr = 0;
-  let minBin0 = 0, maxBin0 = 0;
-
-  try{
+  try {
     const ns = parseFloat(UI.noiseStartSec?.value ?? '5');
     const ne = parseFloat(UI.noiseEndSec?.value ?? '7');
     let startSec = Number.isFinite(ns) ? ns : 5;
-    let endSec = Number.isFinite(ne) ? ne : 7;
+    let endSec   = Number.isFinite(ne) ? ne : 7;
     startSec = Math.max(0, startSec);
-    endSec = Math.max(0, endSec);
-    if (endSec < startSec) { const t=startSec; startSec=endSec; endSec=t; }
-    if (endSec - startSec < 0.2) endSec = startSec + 0.2;
+    endSec   = Math.max(startSec + 0.2, endSec);
 
-    const startByte = Math.max(0, Math.floor(startSec * bytesPerSecEst) - overlapBytes);
-    const endByte = Math.min(file.size, Math.floor(endSec * bytesPerSecEst) + overlapBytes);
-    const nab = await file.slice(startByte, endByte).arrayBuffer();
+    const { mono: monoN } = await getAudioSamples(startSec, endSec);
+    const bins    = Math.max(1, maxBin - minBin + 1);
+    const acc     = new Float64Array(bins);
+    const hopN    = FFT_N >> 1;
+    let framesN   = 0;
 
-    let nbuf;
-    try{
-      nbuf = await audioCtx.decodeAudioData(nab);
-    } catch(e){
-      throw new Error(`背景ノイズ区間 decode失敗: ${e?.message ?? e}`);
-    }
-
-    baselineSr = nbuf.sampleRate;
-    const monoN = nbuf.getChannelData(0);
-
-    const binHz = baselineSr / FFT_N;
-    minBin0 = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
-    maxBin0 = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
-    const bins = Math.max(1, (maxBin0 - minBin0 + 1));
-    baselineDb = new Float32Array(bins);
-    baselineDb.fill(-120);
-
-    const hopN = FFT_N >> 1;
-    const acc = new Float64Array(bins);
-    let framesN = 0;
-
-    for (let i=0; i + FFT_N <= monoN.length; i += hopN){
-      for (let n=0;n<FFT_N;n++){
-        re[n] = monoN[i+n] * hannWindow(n, FFT_N);
-        im[n] = 0;
-      }
+    for (let i = 0; i + FFT_N <= monoN.length; i += hopN) {
+      for (let n = 0; n < FFT_N; n++) { re[n] = monoN[i+n] * hannWindow(n, FFT_N); im[n] = 0; }
       fftInPlace(re, im, plan);
-      for (let b=minBin0; b<=maxBin0; b++){
+      for (let b = minBin; b <= maxBin; b++) {
         const rr = re[b], ii = im[b];
-        acc[b-minBin0] += rr*rr + ii*ii;
+        acc[b - minBin] += rr*rr + ii*ii;
       }
       framesN++;
     }
 
-    if (framesN > 0){
-      for (let k=0;k<bins;k++){
-        baselineDb[k] = 10 * Math.log10((acc[k] / framesN) + 1e-12);
-      }
-      const tmpArr = Array.from(baselineDb).sort((a,b)=>a-b);
-      const mid = tmpArr[Math.floor(tmpArr.length*0.5)];
+    if (framesN > 0) {
+      baselineDb = new Float32Array(bins);
+      for (let k = 0; k < bins; k++) baselineDb[k] = 10 * Math.log10((acc[k] / framesN) + 1e-12);
+      const mid = Array.from(baselineDb).sort((a,b)=>a-b)[Math.floor(bins*0.5)];
       logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / baseline≈${mid.toFixed(1)} dB (per-bin)`);
     } else {
       logLine('ノイズ学習: フレーム不足（baseline=-120dB扱い）');
     }
-  } catch(e){
+  } catch(e) {
     logLine(`ノイズ学習失敗（継続）: ${e?.message ?? e}`);
     baselineDb = null;
-    baselineSr = 0;
   }
 
   logLine(`スキャン開始: decode方式 / duration≈${duration.toFixed(2)}s / SEG=${SEG_SEC.toFixed(2)}s / FFT=${FFT_N}`);
   logLine(`帯域: ${lo}..${hi} Hz / 検出感度(差分): +${thrDeltaDb} dB`);
   logLine(`判定: SEG内で1フレームでも max( frameDb(bin) - baselineDb(bin) ) > +thr`);
 
+  const hop = FFT_N >> 1;
   let lastDetectedBucket = -9999;
 
-  for (let seg=0; seg<totalSeg; seg++){
+  for (let seg = 0; seg < totalSeg; seg++) {
     if (sig.aborted) throw new Error('スキャン中断');
 
     const segStartSec = seg * SEG_SEC;
-    const segEndSec = Math.min(duration, segStartSec + SEG_SEC);
+    const segEndSec   = Math.min(duration, segStartSec + SEG_SEC);
 
-    // byte range (approx, with overlap)
-    const startByte = Math.max(0, Math.floor(segStartSec * bytesPerSecEst) - overlapBytes);
-    const endByte = Math.min(file.size, Math.floor(segEndSec * bytesPerSecEst) + overlapBytes);
-
-    let ab, buf;
-    try{
-      ab = await file.slice(startByte, endByte).arrayBuffer();
-    } catch(e){
-      logLine(`seg#${seg} slice失敗（スキップ）: ${e?.message ?? e}`);
+    // チャンクキャッシュからサンプル取得（MP3/AACはデコード失敗の可能性あり）
+    let mono;
+    try {
+      const samples = await getAudioSamples(segStartSec, segEndSec);
+      mono = samples.mono;
+    } catch (e) {
+      logLine(`seg#${seg} (${fmtHMS(segStartSec)}) サンプル取得失敗（スキップ）: ${e?.message ?? e}`);
       setScanProgress((seg+1)/totalSeg*100);
-      await sleep(0);
+      if (seg % 4 === 0) await sleep(0);
       continue;
     }
 
-    try{
-      buf = await audioCtx.decodeAudioData(ab);
-    } catch(e){
-      // boundary decode fail -> skip
-      logLine(`seg#${seg} decode失敗（スキップ）: ${e?.message ?? e}`);
-      setScanProgress((seg+1)/totalSeg*100);
-      await sleep(0);
-      continue;
-    }
-
-    const sr = buf.sampleRate;
-    const mono = buf.getChannelData(0);
-
-    const binHz = sr / FFT_N;
-    const minBin = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
-    const maxBin = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
-
-    // baseline mismatch -> fallback
-    const useBaseline = (baselineDb && baselineSr === sr && minBin === minBin0 && maxBin === maxBin0);
-
-    const hop = FFT_N >> 1;
     let detected = false;
 
-    for (let i=0; i + FFT_N <= mono.length; i += hop){
-      for (let n=0;n<FFT_N;n++){
-        re[n] = mono[i+n] * hannWindow(n, FFT_N);
-        im[n] = 0;
-      }
+    for (let i = 0; i + FFT_N <= mono.length; i += hop) {
+      for (let n = 0; n < FFT_N; n++) { re[n] = mono[i+n] * hannWindow(n, FFT_N); im[n] = 0; }
       fftInPlace(re, im, plan);
 
       let maxDiffDb = -9999;
-      for (let b=minBin; b<=maxBin; b++){
+      for (let b = minBin; b <= maxBin; b++) {
         const rr = re[b], ii = im[b];
-        const pow = rr*rr + ii*ii;
-        const frameDb = 10 * Math.log10(pow + 1e-12);
-        const base = useBaseline ? baselineDb[b-minBin] : -120;
-        const diff = frameDb - base;
-        if (diff > maxDiffDb) maxDiffDb = diff;
+        const frameDb = 10 * Math.log10(rr*rr + ii*ii + 1e-12);
+        const base = baselineDb ? baselineDb[b - minBin] : -120;
+        if (frameDb - base > maxDiffDb) maxDiffDb = frameDb - base;
       }
 
       if (maxDiffDb >= thrDeltaDb) { detected = true; break; }
       if (sig.aborted) throw new Error('スキャン中断');
     }
 
-    if (detected){
+    if (detected) {
       const bucket = Math.floor(segStartSec / SEG_SEC);
-      if (bucket !== lastDetectedBucket){
+      if (bucket !== lastDetectedBucket) {
         addDetectButton(segStartSec);
         lastDetectedBucket = bucket;
       }
@@ -1497,23 +1549,7 @@ async function scanBandDecode(file){
 
 
 async function scanBand(file){
-  // IMPORTANT:
-  // - WAV以外(例: MP3/M4A/OGG)は readWavHeader を呼ばず decode方式へ直行
-  // - WAVでもヘッダ/切れ目で失敗したら decode方式へフォールバックして完走を優先
-  const name = (file?.name || '').toLowerCase();
-  const type = (file?.type || '').toLowerCase();
-  const isWav = type.includes('wav') || name.endsWith('.wav') || name.endsWith('.wave');
-
   try{
-    if (isWav){
-      try{
-        await scanBand(file);
-        return;
-      } catch(e){
-        // WAVとして扱ったが失敗 -> decode方式へ切替
-        logLine(`WAV解析失敗→decode方式へ切替: ${e?.message ?? e}`);
-      }
-    }
     await scanBandDecode(file);
   } finally {
     UI.scanBtn.disabled = false;
@@ -1545,6 +1581,336 @@ UI.scanBtn.addEventListener('click', async () => {
 UI.scanAbortBtn.addEventListener('click', () => {
   if (scanAbortCtrl) scanAbortCtrl.abort();
 });
+
+
+/** ===================== Bulk Export (全件一括出力) ===================== */
+
+/**
+ * 次の2のべき乗を返す（FFT用）
+ */
+function nextPow2(n) {
+  let v = 1;
+  while (v < n) v <<= 1;
+  return v;
+}
+
+/**
+ * オフスクリーンで1件分のスペクトログラムJPEGを生成する
+ * decodeAudioData → FFT → Canvas塗り → JPEG Blob
+ * @param {File} file
+ * @param {number} timeSec  中心時刻（秒）
+ * @param {number} halfSec  前後何秒切り出すか（デフォルト5）
+ */
+async function generateDetectionSpectrogram(file, timeSec, halfSec = 5) {
+  const clipStart = Math.max(0, timeSec - halfSec);
+  const clipEnd   = Math.min(analyzer.duration, timeSec + halfSec);
+  const clipDur   = Math.max(0.1, clipEnd - clipStart);
+
+  const { mono, sr } = await getAudioSamples(clipStart, clipEnd);
+
+  const cfg  = getConfig();
+
+  const FFT_N   = clamp(nextPow2(cfg.fftSize), 512, 4096);
+  const halfFFT = (FFT_N >> 1) - 1;
+  const plan    = makeFft(FFT_N);
+  const re      = new Float32Array(FFT_N);
+  const im      = new Float32Array(FFT_N);
+  const binHz   = sr / FFT_N;
+
+  // ── LUT 1: Hann窓 ───────────────────────────────────────────────
+  // 毎列 FFT_N 回の Math.cos を 1 回の事前計算に削減
+  const hannLUT = new Float32Array(FFT_N);
+  for (let n = 0; n < FFT_N; n++) {
+    hannLUT[n] = 0.5 * (1.0 - Math.cos((2 * Math.PI * n) / (FFT_N - 1)));
+  }
+
+  // ── LUT 2: y行 → FFT bin インデックス ───────────────────────────
+  // 毎列 TILE_H 回の Math.log/exp を 1 回の事前計算に削減
+  const height  = TILE_H;
+  const binLUT  = new Int32Array(height);
+  for (let y = 0; y < height; y++) {
+    const hz = yToHzByScale(y, cfg, height);
+    binLUT[y] = clamp(Math.round(hz / binHz), 0, halfFFT);
+  }
+
+  // ── LUT 3: カラーパレット（1024エントリ × RGB）──────────────────
+  // 毎ピクセルの mapColor 関数呼び出し＋switch＋配列分割を排除
+  const CLUT_N   = 1024;
+  const CLUT_MAX = CLUT_N - 1;
+  const colorLUT = new Uint8Array(CLUT_N * 3);
+  for (let i = 0; i < CLUT_N; i++) {
+    const [r, g, b] = mapColor(cfg.colorMap, i / CLUT_MAX);
+    colorLUT[i * 3]     = r;
+    colorLUT[i * 3 + 1] = g;
+    colorLUT[i * 3 + 2] = b;
+  }
+
+  // ── 出力幅: 静止画なので 30fps で十分（FFT 回数を半減）──────────
+  const EXPORT_FPS    = clamp(Math.min(cfg.fps, 30), 10, 60);
+  const samplesPerCol = Math.max(1, Math.floor(sr / EXPORT_FPS));
+  const width         = Math.max(1, Math.ceil(clipDur * EXPORT_FPS));
+
+  const oc = (typeof OffscreenCanvas !== 'undefined')
+    ? new OffscreenCanvas(width, height)
+    : (() => { const c = document.createElement('canvas'); c.width = width; c.height = height; return c; })();
+
+  const ctx     = oc.getContext('2d');
+  const imgData = ctx.createImageData(width, height);
+  const data    = imgData.data;
+
+  // Math.log(x) より Math.log10 が遅いブラウザへの対策
+  // 10*log10(x) = (10/ln10) * ln(x)
+  const LOG10_SCALE = 10.0 / Math.LN10;
+  const invRange    = 1.0 / Math.max(1e-6, cfg.maxDb - cfg.minDb);
+  const minDb       = cfg.minDb;
+
+  // ── Web Audio AnalyserNode との dB スケール一致補正 ────────────────
+  // Chromium RealtimeAnalyser は scaler=1/N で正規化 → normDb = -20*log10(N)
+  // 例: FFT_N=1024 → normDb≈-60.2dB, FFT_N=2048 → ≈-66.2dB
+  const normDb = -20.0 * Math.log10(FFT_N);
+
+  // 画像の alpha 値をまとめて 255 で初期化
+  for (let i = 3; i < data.length; i += 4) data[i] = 255;
+
+  for (let x = 0; x < width; x++) {
+    const sampleStart = x * samplesPerCol;
+    const xBase       = x * 4;                   // 列先頭のバイトオフセット（stride=width*4）
+
+    if (sampleStart + FFT_N > mono.length) {
+      // 末尾: 前の列をそのままコピー
+      if (x > 0) {
+        const prevXBase = (x - 1) * 4;
+        const stride    = width * 4;
+        for (let y = 0; y < height; y++) {
+          const row = y * stride;
+          data[row + xBase]     = data[row + prevXBase];
+          data[row + xBase + 1] = data[row + prevXBase + 1];
+          data[row + xBase + 2] = data[row + prevXBase + 2];
+        }
+      }
+      continue;
+    }
+
+    // Hann窓 + FFT（LUT で cos 計算ゼロ）
+    for (let n = 0; n < FFT_N; n++) {
+      re[n] = mono[sampleStart + n] * hannLUT[n];
+      im[n] = 0;
+    }
+    fftInPlace(re, im, plan);
+
+    // ピクセル列を書き込む（LUT で log/exp・関数呼び出しゼロ）
+    const stride = width * 4;
+    for (let y = 0; y < height; y++) {
+      const bin  = binLUT[y];
+      const rr   = re[bin], ii = im[bin];
+      const db   = LOG10_SCALE * Math.log(rr * rr + ii * ii + 1e-12) + normDb;
+      const ci   = clamp(((db - minDb) * invRange * CLUT_MAX + 0.5) | 0, 0, CLUT_MAX) * 3;
+      const idx  = y * stride + xBase;
+      data[idx]     = colorLUT[ci];
+      data[idx + 1] = colorLUT[ci + 1];
+      data[idx + 2] = colorLUT[ci + 2];
+    }
+
+    // 全列がオフスクリーン処理なので yield は 128 列に 1 回で十分
+    if ((x & 127) === 127) await sleep(0);
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+
+  const blob = await (oc.convertToBlob
+    ? oc.convertToBlob({ type: 'image/jpeg', quality: 0.88 })
+    : new Promise(res => oc.toBlob(res, 'image/jpeg', 0.88)));
+
+  return blob;
+}
+
+/**
+ * AudioBuffer → 16bit PCM WAV Blob
+ */
+function audioBufferToWav(audioBuffer) {
+  const numChannels = audioBuffer.numberOfChannels;
+  const sampleRate  = audioBuffer.sampleRate;
+  const numSamples  = audioBuffer.length;
+  const bytesPerSample = 2; // 16-bit
+  const blockAlign  = numChannels * bytesPerSample;
+  const byteRate    = sampleRate * blockAlign;
+  const dataSize    = numSamples * blockAlign;
+  const totalSize   = 44 + dataSize;
+
+  const ab = new ArrayBuffer(totalSize);
+  const dv = new DataView(ab);
+
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) dv.setUint8(offset + i, str.charCodeAt(i));
+  };
+
+  writeStr(0, 'RIFF');
+  dv.setUint32(4, totalSize - 8, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  dv.setUint32(16, 16, true);          // fmt chunk size
+  dv.setUint16(20, 1, true);           // PCM
+  dv.setUint16(22, numChannels, true);
+  dv.setUint32(24, sampleRate, true);
+  dv.setUint32(28, byteRate, true);
+  dv.setUint16(32, blockAlign, true);
+  dv.setUint16(34, 16, true);          // bits per sample
+  writeStr(36, 'data');
+  dv.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < numSamples; i++) {
+    for (let ch = 0; ch < numChannels; ch++) {
+      const s = clamp(audioBuffer.getChannelData(ch)[i], -1, 1);
+      dv.setInt16(offset, Math.round(s * 32767), true);
+      offset += 2;
+    }
+  }
+
+  return new Blob([ab], { type: 'audio/wav' });
+}
+
+/**
+ * 指定時刻 ±halfSec の音声を WAV Blob として返す
+ */
+async function extractAudioClipWav(file, timeSec, halfSec = 5) {
+  const clipStart = Math.max(0, timeSec - halfSec);
+  const clipEnd   = Math.min(analyzer.duration, timeSec + halfSec);
+
+  // チャンクキャッシュからモノラルサンプルを取得してWAV化
+  const { mono, sr } = await getAudioSamples(clipStart, clipEnd);
+
+  // audioBufferToWav に渡せる軽量互換オブジェクトを生成
+  const clipBuf = {
+    sampleRate: sr,
+    numberOfChannels: 1,
+    length: mono.length,
+    getChannelData: () => mono,
+  };
+  return audioBufferToWav(clipBuf);
+}
+
+/**
+ * 検出リスト全件を ZIP にまとめてダウンロード
+ */
+async function exportAll() {
+  const file = UI.fileInput.files?.[0];
+  if (!file) {
+    alert('音声ファイルを選択してください');
+    return;
+  }
+  if (!analyzer.inited) {
+    alert('先に「読み込み/準備」を実行してください');
+    return;
+  }
+
+  if (typeof JSZip === 'undefined') {
+    alert('JSZip が読み込まれていません。インターネット接続を確認して再読み込みしてください。');
+    return;
+  }
+
+  // 検出リストのボタン一覧から秒数を収集
+  const buttons = Array.from(UI.detectList.querySelectorAll('button'));
+  if (buttons.length === 0) {
+    alert('検出リストが空です。先に「全時間スキャン」を実行してください。');
+    return;
+  }
+
+  const detections = buttons.map(btn => {
+    const t = parseFloat(btn.dataset.sec);
+    return Number.isFinite(t) ? t : 0;
+  });
+
+  UI.exportAllBtn.disabled = true;
+  UI.exportProgress.className = '';
+  const total = detections.length;
+
+  const setProgress = (msg) => {
+    UI.exportProgress.textContent = msg;
+  };
+
+  try {
+    const zip = new JSZip();
+    const imgFolder   = zip.folder('images');
+    const audioFolder = zip.folder('audio');
+
+    // CSV ヘッダ（BOM付きUTF-8で Excel 互換）
+    const csvRows = [['検出時刻', '画像ファイル名', '', '']];
+
+    for (let i = 0; i < total; i++) {
+      const sec         = detections[i];
+      const timeLabel   = fmtHMS(sec);
+      const fileTimePart = fmtFileTime(sec);
+      const imgName     = `cut_${fileTimePart}.jpg`;
+      const audioName   = `cut_${fileTimePart}.wav`;
+
+      // --- 画像生成 ---
+      setProgress(`画像生成中... (${i + 1}/${total}件) ${timeLabel}`);
+      await sleep(0); // UI更新を優先
+
+      let imgBlob = null;
+      try {
+        imgBlob = await generateDetectionSpectrogram(file, sec, 5);
+        imgFolder.file(imgName, imgBlob);
+      } catch (e) {
+        logLine(`[画像失敗] ${timeLabel}: ${e?.message ?? e}`);
+      }
+
+      // --- 音声切り出し ---
+      setProgress(`音声切り出し中... (${i + 1}/${total}件) ${timeLabel}`);
+      await sleep(0);
+
+      let audioBlob = null;
+      try {
+        audioBlob = await extractAudioClipWav(file, sec, 5);
+        audioFolder.file(audioName, audioBlob);
+      } catch (e) {
+        logLine(`[音声失敗] ${timeLabel}: ${e?.message ?? e}`);
+      }
+
+      csvRows.push([
+        timeLabel,
+        imgBlob ? imgName : '(生成失敗)',
+        '',
+        ''
+      ]);
+
+      logLine(`出力済み (${i + 1}/${total}): ${timeLabel}`);
+    }
+
+    // --- CSV 生成 ---
+    setProgress('CSV・ZIP生成中...');
+    await sleep(0);
+
+    const csvContent = '\uFEFF' + // BOM
+      csvRows.map(row => row.map(v => `"${v.replace(/"/g, '""')}"`).join(',')).join('\r\n');
+    zip.file('detections.csv', csvContent);
+
+    // --- ZIP 生成 & ダウンロード ---
+    const zipBlob = await zip.generateAsync(
+      { type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 5 } },
+      (meta) => {
+        setProgress(`ZIP圧縮中... ${meta.percent.toFixed(0)}%`);
+      }
+    );
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    downloadBlob(zipBlob, `birdvoice_export_${stamp}.zip`);
+
+    setProgress(`✅ 完了！ ${total}件を出力しました`);
+    logLine(`全件出力完了: ${total}件 → birdvoice_export_${stamp}.zip`);
+
+  } catch (e) {
+    UI.exportProgress.className = 'error';
+    setProgress(`❌ エラー: ${e?.message ?? e}`);
+    logLine(`全件出力失敗: ${e?.message ?? e}`);
+  } finally {
+    UI.exportAllBtn.disabled = false;
+  }
+}
+
+UI.exportAllBtn.addEventListener('click', exportAll);
+
 
 wireScanSliders();
 
