@@ -189,9 +189,6 @@ let analyzer = {
   gain: null,
   inited: false,
   duration: 0,
-  // ファイル全体のデコード済みAudioBuffer（タイル・エクスポート共用キャッシュ）
-  fullBuffer: null,
-  fullBufferFile: null, // キャッシュ対象ファイルの参照
 };
 
 async function ensureFullAudioMetadata(file) {
@@ -252,42 +249,164 @@ async function initAnalyzerForFile(file) {
   analyzer.inited = true;
 }
 
+// ── Audio Chunk Cache ────────────────────────────────────────────────────────
+// MP3/AACはバイトスライスでdecodeAudioDataできないため、ファイル全体を1回デコードする。
+// 長尺ファイルのメモリ問題を解決するため、デコード直後に5分チャンクへ分割して
+// 大バッファを解放し、LRUで最大8チャンク（≒320MB）だけメモリに保持する。
+
+const AUDIO_CHUNK_SEC  = 5 * 60;   // 1チャンク = 5分
+const MAX_AUDIO_CHUNKS = 8;         // 最大保持チャンク数 ≒ 320〜400 MB
+
+// Map<chunkIndex, { mono: Float32Array, sr: number, lastUsed: number }>
+const audioChunkCache = new Map();
+let   _audioChunkFile    = null;   // キャッシュが対応するFileオブジェクト
+let   _audioDecodePromise = null;  // 重複デコード防止用Promise
+
+/** チャンクキャッシュをリセット（ファイル変更時・clearAll時） */
+function clearAudioChunkCache() {
+  audioChunkCache.clear();
+  _audioChunkFile    = null;
+  _audioDecodePromise = null;
+}
+
+/** LRU上限を超えたチャンクを解放 */
+function pruneAudioChunks() {
+  if (audioChunkCache.size <= MAX_AUDIO_CHUNKS) return;
+  const sorted = [...audioChunkCache.entries()].sort((a,b) => a[1].lastUsed - b[1].lastUsed);
+  const remove = sorted.slice(0, audioChunkCache.size - MAX_AUDIO_CHUNKS);
+  for (const [k] of remove) audioChunkCache.delete(k);
+}
+
 /**
- * ファイル全体をデコードした AudioBuffer を返す（キャッシュ付き）。
- * MP3/AAC はバイトスライスだとヘッダーがなくなり decodeAudioData が失敗するため、
- * ファイル全体を1回だけデコードしてキャッシュし、タイル・エクスポートで共有する。
- * ファイルが変わった場合（再ロード時）はキャッシュを破棄して再デコードする。
+ * ファイル全体を1回デコードし、AUDIO_CHUNK_SEC ごとのチャンクに分割してキャッシュ。
+ * 重複呼び出しは先行Promiseを待つ。ファイルが変わったときは再実行。
  */
-let _fullBufferPromise = null;
-async function getFullAudioBuffer() {
+async function ensureAudioDecoded() {
   if (!analyzer.file) throw new Error('ファイル未ロード');
 
-  // 同じファイルのキャッシュがあればそれを返す
-  if (analyzer.fullBuffer && analyzer.fullBufferFile === analyzer.file) {
-    return analyzer.fullBuffer;
-  }
+  // 同じファイルがすでに分割済みなら何もしない
+  if (_audioChunkFile === analyzer.file && audioChunkCache.size > 0) return;
 
-  // 既に進行中のデコードがあれば待つ（重複デコード防止）
-  if (_fullBufferPromise) return _fullBufferPromise;
+  // 既に進行中なら待つ
+  if (_audioDecodePromise) { await _audioDecodePromise; return; }
 
-  _fullBufferPromise = (async () => {
-    logLine('音声をデコード中...');
+  _audioDecodePromise = (async () => {
+    clearAudioChunkCache();
+    const mb = (analyzer.file.size / 1024 / 1024).toFixed(0);
+    logLine(`音声デコード中... (${mb} MB) ※長尺ファイルは少し時間がかかります`);
+
     const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
     try {
       const ab  = await analyzer.file.arrayBuffer();
       const buf = await decodeCtx.decodeAudioData(ab);
-      analyzer.fullBuffer     = buf;
-      analyzer.fullBufferFile = analyzer.file;
-      logLine(`デコード完了 (${buf.sampleRate} Hz, ${buf.numberOfChannels}ch, ${buf.duration.toFixed(1)}s)`);
-      return buf;
+
+      const sr       = buf.sampleRate;
+      const fullMono = buf.getChannelData(0);
+      const chunkLen = Math.floor(AUDIO_CHUNK_SEC * sr);
+      const total    = fullMono.length;
+      const numChunks = Math.ceil(total / chunkLen);
+
+      // チャンクに分割してコピー（subarray は元バッファへの参照のままなので copy が必要）
+      for (let ci = 0; ci < numChunks; ci++) {
+        const s = ci * chunkLen;
+        const e = Math.min(total, s + chunkLen);
+        const copy = new Float32Array(e - s);
+        copy.set(fullMono.subarray(s, e));
+        audioChunkCache.set(ci, { mono: copy, sr, lastUsed: Date.now() });
+      }
+
+      // fullMono（大バッファ）への参照を手放す → GCに回る
+      // buf変数もこのスコープ外に出ないのでGC対象になる
+      _audioChunkFile = analyzer.file;
+
+      const durStr = buf.duration >= 60
+        ? `${Math.floor(buf.duration/60)}分${Math.round(buf.duration%60)}秒`
+        : `${buf.duration.toFixed(1)}秒`;
+      logLine(`デコード完了 (${sr} Hz, ${numChunks}チャンク, ${durStr})`);
     } finally {
       try { decodeCtx.close(); } catch {}
-      _fullBufferPromise = null;
+      _audioDecodePromise = null;
     }
   })();
 
-  return _fullBufferPromise;
+  await _audioDecodePromise;
 }
+
+/**
+ * 指定時間範囲のモノラルサンプルを返す。
+ * チャンクにまたがる場合はコピーして結合する。
+ * @returns {{ mono: Float32Array, sr: number }}
+ */
+async function getAudioSamples(startSec, endSec) {
+  await ensureAudioDecoded();
+
+  // どのチャンクが必要か
+  const firstChunkIdx = Math.floor(startSec / AUDIO_CHUNK_SEC);
+  const lastChunkIdx  = Math.floor(Math.max(startSec, endSec - 1e-9) / AUDIO_CHUNK_SEC);
+
+  // 必要チャンクの lastUsed を更新（LRU管理）
+  for (let ci = firstChunkIdx; ci <= lastChunkIdx; ci++) {
+    const chunk = audioChunkCache.get(ci);
+    if (chunk) chunk.lastUsed = Date.now();
+  }
+  pruneAudioChunks();
+
+  const firstChunk = audioChunkCache.get(firstChunkIdx);
+  if (!firstChunk) throw new Error(`チャンク ${firstChunkIdx} が見つかりません`);
+  const sr = firstChunk.sr;
+
+  if (firstChunkIdx === lastChunkIdx) {
+    // 1チャンク内に収まる（典型ケース: タイル・スキャンセグメント・検出周辺）
+    const chunkStartSec = firstChunkIdx * AUDIO_CHUNK_SEC;
+    const s = Math.floor((startSec - chunkStartSec) * sr);
+    const e = Math.min(firstChunk.mono.length, Math.ceil((endSec - chunkStartSec) * sr));
+    return { mono: firstChunk.mono.subarray(Math.max(0, s), e), sr };
+  }
+
+  // チャンク境界をまたぐ場合: 必要サンプルをコピーして結合
+  const totalLen = Math.ceil((endSec - startSec) * sr);
+  const result   = new Float32Array(totalLen);
+  let   written  = 0;
+
+  for (let ci = firstChunkIdx; ci <= lastChunkIdx; ci++) {
+    const chunk = audioChunkCache.get(ci);
+    if (!chunk) break;
+    const chunkStartSec = ci * AUDIO_CHUNK_SEC;
+    const chunkEndSec   = chunkStartSec + AUDIO_CHUNK_SEC;
+    const sInChunk = Math.max(0, Math.floor((startSec - chunkStartSec) * sr));
+    const eInChunk = Math.min(chunk.mono.length, Math.ceil((Math.min(endSec, chunkEndSec) - chunkStartSec) * sr));
+    const slice = chunk.mono.subarray(sInChunk, eInChunk);
+    const copyLen = Math.min(slice.length, totalLen - written);
+    result.set(slice.subarray(0, copyLen), written);
+    written += copyLen;
+    if (written >= totalLen) break;
+  }
+
+  return { mono: result.subarray(0, written), sr };
+}
+
+// 後方互換: getFullAudioBuffer() の呼び出し元がまだあれば動くようにラップ
+async function getFullAudioBuffer() {
+  await ensureAudioDecoded();
+  // 最初のチャンクから sr だけ取得して互換オブジェクトを返す（旧コード用）
+  const first = audioChunkCache.get(0);
+  if (!first) throw new Error('デコードに失敗しました');
+  // 全チャンクをフラット化（短いファイル or 後方互換のみ使用）
+  const sr = first.sr;
+  const totalSamples = [...audioChunkCache.values()].reduce((acc, c) => acc + c.mono.length, 0);
+  const all = new Float32Array(totalSamples);
+  let off = 0;
+  for (const [, c] of [...audioChunkCache.entries()].sort((a,b)=>a[0]-b[0])) {
+    all.set(c.mono, off); off += c.mono.length;
+  }
+  return { sampleRate: sr, getChannelData: () => all, length: totalSamples, duration: totalSamples / sr, numberOfChannels: 1 };
+}
+
+/** デコードキャッシュを明示的に解放（clearAll時） */
+function releaseFullBuffer() {
+  clearAudioChunkCache();
+}
+
 
 /** ===================== Tile cache (LRU) ===================== */
 const tileCache = new Map();
@@ -494,16 +613,9 @@ async function generateTileBitmap(tileIndex, cfg, abortSignal) {
   if (abortSignal?.aborted) throw new Error('abort');
 
   // ── ファイル全体のデコード済みバッファを取得（MP3/AACのバイトスライス問題を回避）──
-  const fullBuf = await getFullAudioBuffer();
   if (abortSignal?.aborted) throw new Error('abort');
-
-  const sr       = fullBuf.sampleRate;
-  const fullMono = fullBuf.getChannelData(0);
-
-  // タイル区間をサンプル単位でスライス（コピーなし・高速）
-  const startSample = Math.floor(tileStart * sr);
-  const endSample   = Math.min(fullMono.length, Math.ceil(tileEnd * sr));
-  const mono        = fullMono.subarray(startSample, endSample);
+  const { mono, sr } = await getAudioSamples(tileStart, tileEnd);
+  if (abortSignal?.aborted) throw new Error('abort');
 
   {  // ブロックスコープ（try/finallyを削除しシンプルに）
 
@@ -828,9 +940,7 @@ function clearAll() {
   analyzer.file = null;
   analyzer.inited = false;
   analyzer.duration = 0;
-  analyzer.fullBuffer = null;
-  analyzer.fullBufferFile = null;
-  _fullBufferPromise = null;
+  clearAudioChunkCache();
 
   UI.log.textContent = '';
   UI.barFill.style.width = '0%';
@@ -1379,12 +1489,12 @@ async function scanBandWav(file){
   logLine('スキャン完了');
   setState('準備完了');
   UI.scanAbortBtn.disabled = true;
+
 }
 
 
 async function scanBandDecode(file){
   const SEG_SEC = getScanSegSec();
-  const OVERLAP_SEC = 0.25;
 
   setState('スキャン中');
   UI.scanBtn.disabled = true;
@@ -1400,10 +1510,6 @@ async function scanBandDecode(file){
 
   const totalSeg = Math.ceil(duration / SEG_SEC);
 
-  const bytesPerSecEst = file.size / duration;
-  const segBytes = Math.max(256*1024, Math.floor(bytesPerSecEst * SEG_SEC));
-  const overlapBytes = Math.floor(bytesPerSecEst * OVERLAP_SEC);
-
   const FFT_N = 2048;
   const plan = makeFft(FFT_N);
   const re = new Float32Array(FFT_N);
@@ -1415,148 +1521,95 @@ async function scanBandDecode(file){
   const lo = Math.min(minHz, maxHz);
   const hi = Math.max(minHz, maxHz);
 
-  if (!analyzer.audioCtx) analyzer.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  const audioCtx = analyzer.audioCtx;
-  if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch {} }
+  // ── 音声デコード（チャンクキャッシュ経由、MP3/AAC/WAV すべて対応）─────
+  logLine('音声デコード中...');
+  await ensureAudioDecoded();
+  if (sig.aborted) throw new Error('スキャン中断');
 
+  // sr はどのチャンクも同じなのでチャンク0から取得
+  const _chunk0 = audioChunkCache.get(0);
+  if (!_chunk0) throw new Error('デコードに失敗しました');
+  const sr    = _chunk0.sr;
+  const binHz = sr / FFT_N;
+  const minBin = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
+  const maxBin = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
+
+  // ── ノイズベースライン学習 ────────────────────────────────────────────
   let baselineDb = null;
-  let baselineSr = 0;
-  let minBin0 = 0, maxBin0 = 0;
-
-  try{
+  try {
     const ns = parseFloat(UI.noiseStartSec?.value ?? '5');
     const ne = parseFloat(UI.noiseEndSec?.value ?? '7');
     let startSec = Number.isFinite(ns) ? ns : 5;
-    let endSec = Number.isFinite(ne) ? ne : 7;
+    let endSec   = Number.isFinite(ne) ? ne : 7;
     startSec = Math.max(0, startSec);
-    endSec = Math.max(0, endSec);
-    if (endSec < startSec) { const t=startSec; startSec=endSec; endSec=t; }
-    if (endSec - startSec < 0.2) endSec = startSec + 0.2;
+    endSec   = Math.max(startSec + 0.2, endSec);
 
-    const startByte = Math.max(0, Math.floor(startSec * bytesPerSecEst) - overlapBytes);
-    const endByte = Math.min(file.size, Math.floor(endSec * bytesPerSecEst) + overlapBytes);
-    const nab = await file.slice(startByte, endByte).arrayBuffer();
+    const { mono: monoN } = await getAudioSamples(startSec, endSec);
+    const bins    = Math.max(1, maxBin - minBin + 1);
+    const acc     = new Float64Array(bins);
+    const hopN    = FFT_N >> 1;
+    let framesN   = 0;
 
-    let nbuf;
-    try{
-      nbuf = await audioCtx.decodeAudioData(nab);
-    } catch(e){
-      throw new Error(`背景ノイズ区間 decode失敗: ${e?.message ?? e}`);
-    }
-
-    baselineSr = nbuf.sampleRate;
-    const monoN = nbuf.getChannelData(0);
-
-    const binHz = baselineSr / FFT_N;
-    minBin0 = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
-    maxBin0 = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
-    const bins = Math.max(1, (maxBin0 - minBin0 + 1));
-    baselineDb = new Float32Array(bins);
-    baselineDb.fill(-120);
-
-    const hopN = FFT_N >> 1;
-    const acc = new Float64Array(bins);
-    let framesN = 0;
-
-    for (let i=0; i + FFT_N <= monoN.length; i += hopN){
-      for (let n=0;n<FFT_N;n++){
-        re[n] = monoN[i+n] * hannWindow(n, FFT_N);
-        im[n] = 0;
-      }
+    for (let i = 0; i + FFT_N <= monoN.length; i += hopN) {
+      for (let n = 0; n < FFT_N; n++) { re[n] = monoN[i+n] * hannWindow(n, FFT_N); im[n] = 0; }
       fftInPlace(re, im, plan);
-      for (let b=minBin0; b<=maxBin0; b++){
+      for (let b = minBin; b <= maxBin; b++) {
         const rr = re[b], ii = im[b];
-        acc[b-minBin0] += rr*rr + ii*ii;
+        acc[b - minBin] += rr*rr + ii*ii;
       }
       framesN++;
     }
 
-    if (framesN > 0){
-      for (let k=0;k<bins;k++){
-        baselineDb[k] = 10 * Math.log10((acc[k] / framesN) + 1e-12);
-      }
-      const tmpArr = Array.from(baselineDb).sort((a,b)=>a-b);
-      const mid = tmpArr[Math.floor(tmpArr.length*0.5)];
+    if (framesN > 0) {
+      baselineDb = new Float32Array(bins);
+      for (let k = 0; k < bins; k++) baselineDb[k] = 10 * Math.log10((acc[k] / framesN) + 1e-12);
+      const mid = Array.from(baselineDb).sort((a,b)=>a-b)[Math.floor(bins*0.5)];
       logLine(`ノイズ学習: ${startSec.toFixed(1)}s〜${endSec.toFixed(1)}s / baseline≈${mid.toFixed(1)} dB (per-bin)`);
     } else {
       logLine('ノイズ学習: フレーム不足（baseline=-120dB扱い）');
     }
-  } catch(e){
+  } catch(e) {
     logLine(`ノイズ学習失敗（継続）: ${e?.message ?? e}`);
     baselineDb = null;
-    baselineSr = 0;
   }
 
   logLine(`スキャン開始: decode方式 / duration≈${duration.toFixed(2)}s / SEG=${SEG_SEC.toFixed(2)}s / FFT=${FFT_N}`);
   logLine(`帯域: ${lo}..${hi} Hz / 検出感度(差分): +${thrDeltaDb} dB`);
   logLine(`判定: SEG内で1フレームでも max( frameDb(bin) - baselineDb(bin) ) > +thr`);
 
+  const hop = FFT_N >> 1;
   let lastDetectedBucket = -9999;
 
-  for (let seg=0; seg<totalSeg; seg++){
+  for (let seg = 0; seg < totalSeg; seg++) {
     if (sig.aborted) throw new Error('スキャン中断');
 
     const segStartSec = seg * SEG_SEC;
-    const segEndSec = Math.min(duration, segStartSec + SEG_SEC);
+    const segEndSec   = Math.min(duration, segStartSec + SEG_SEC);
 
-    const startByte = Math.max(0, Math.floor(segStartSec * bytesPerSecEst) - overlapBytes);
-    const endByte = Math.min(file.size, Math.floor(segEndSec * bytesPerSecEst) + overlapBytes);
+    // チャンクキャッシュからサンプル取得（デコード不要・失敗なし）
+    const { mono } = await getAudioSamples(segStartSec, segEndSec);
 
-    let ab, buf;
-    try{
-      ab = await file.slice(startByte, endByte).arrayBuffer();
-    } catch(e){
-      logLine(`seg#${seg} slice失敗（スキップ）: ${e?.message ?? e}`);
-      setScanProgress((seg+1)/totalSeg*100);
-      await sleep(0);
-      continue;
-    }
-
-    try{
-      buf = await audioCtx.decodeAudioData(ab);
-    } catch(e){
-      logLine(`seg#${seg} decode失敗（スキップ）: ${e?.message ?? e}`);
-      setScanProgress((seg+1)/totalSeg*100);
-      await sleep(0);
-      continue;
-    }
-
-    const sr = buf.sampleRate;
-    const mono = buf.getChannelData(0);
-
-    const binHz = sr / FFT_N;
-    const minBin = clamp(Math.floor(lo / binHz), 0, (FFT_N/2)|0);
-    const maxBin = clamp(Math.ceil(hi / binHz), 0, (FFT_N/2)|0);
-
-    const useBaseline = (baselineDb && baselineSr === sr && minBin === minBin0 && maxBin === maxBin0);
-
-    const hop = FFT_N >> 1;
     let detected = false;
 
-    for (let i=0; i + FFT_N <= mono.length; i += hop){
-      for (let n=0;n<FFT_N;n++){
-        re[n] = mono[i+n] * hannWindow(n, FFT_N);
-        im[n] = 0;
-      }
+    for (let i = 0; i + FFT_N <= mono.length; i += hop) {
+      for (let n = 0; n < FFT_N; n++) { re[n] = mono[i+n] * hannWindow(n, FFT_N); im[n] = 0; }
       fftInPlace(re, im, plan);
 
       let maxDiffDb = -9999;
-      for (let b=minBin; b<=maxBin; b++){
+      for (let b = minBin; b <= maxBin; b++) {
         const rr = re[b], ii = im[b];
-        const pow = rr*rr + ii*ii;
-        const frameDb = 10 * Math.log10(pow + 1e-12);
-        const base = useBaseline ? baselineDb[b-minBin] : -120;
-        const diff = frameDb - base;
-        if (diff > maxDiffDb) maxDiffDb = diff;
+        const frameDb = 10 * Math.log10(rr*rr + ii*ii + 1e-12);
+        const base = baselineDb ? baselineDb[b - minBin] : -120;
+        if (frameDb - base > maxDiffDb) maxDiffDb = frameDb - base;
       }
 
       if (maxDiffDb >= thrDeltaDb) { detected = true; break; }
       if (sig.aborted) throw new Error('スキャン中断');
     }
 
-    if (detected){
+    if (detected) {
       const bucket = Math.floor(segStartSec / SEG_SEC);
-      if (bucket !== lastDetectedBucket){
+      if (bucket !== lastDetectedBucket) {
         addDetectButton(segStartSec);
         lastDetectedBucket = bucket;
       }
@@ -1573,19 +1626,7 @@ async function scanBandDecode(file){
 
 
 async function scanBand(file){
-  const name = (file?.name || '').toLowerCase();
-  const type = (file?.type || '').toLowerCase();
-  const isWav = type.includes('wav') || name.endsWith('.wav') || name.endsWith('.wave');
-
   try{
-    if (isWav){
-      try{
-        await scanBandWav(file);
-        return;
-      } catch(e){
-        logLine(`WAV解析失敗→decode方式へ切替: ${e?.message ?? e}`);
-      }
-    }
     await scanBandDecode(file);
   } finally {
     UI.scanBtn.disabled = false;
@@ -1642,14 +1683,7 @@ async function generateDetectionSpectrogram(file, timeSec, halfSec = 5) {
   const clipEnd   = Math.min(analyzer.duration, timeSec + halfSec);
   const clipDur   = Math.max(0.1, clipEnd - clipStart);
 
-  // getFullAudioBuffer でキャッシュ済み全デコードを使う（MP3/AACのバイトスライス問題を回避）
-  const fullBuf = await getFullAudioBuffer();
-  const sr      = fullBuf.sampleRate;
-  const fullMono = fullBuf.getChannelData(0);
-
-  const startSample = Math.floor(clipStart * sr);
-  const endSample   = Math.min(fullMono.length, Math.ceil(clipEnd * sr));
-  const mono        = fullMono.subarray(startSample, endSample);
+  const { mono, sr } = await getAudioSamples(clipStart, clipEnd);
 
   const cfg  = getConfig();
 
@@ -1820,24 +1854,16 @@ async function extractAudioClipWav(file, timeSec, halfSec = 5) {
   const clipStart = Math.max(0, timeSec - halfSec);
   const clipEnd   = Math.min(analyzer.duration, timeSec + halfSec);
 
-  // getFullAudioBuffer でキャッシュ済みバッファからサンプル単位でスライス
-  const fullBuf = await getFullAudioBuffer();
-  const sr      = fullBuf.sampleRate;
-  const numCh   = fullBuf.numberOfChannels;
+  // チャンクキャッシュからモノラルサンプルを取得してWAV化
+  const { mono, sr } = await getAudioSamples(clipStart, clipEnd);
 
-  const startSample = Math.floor(clipStart * sr);
-  const endSample   = Math.min(fullBuf.length, Math.ceil(clipEnd * sr));
-  const clipLen     = endSample - startSample;
-
-  // AudioBuffer を手動生成してチャンネルデータをコピー
-  const clipCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sr });
-  const clipBuf = clipCtx.createBuffer(numCh, clipLen, sr);
-  for (let ch = 0; ch < numCh; ch++) {
-    const src = fullBuf.getChannelData(ch).subarray(startSample, endSample);
-    clipBuf.copyToChannel(src, ch);
-  }
-  try { clipCtx.close(); } catch {}
-
+  // audioBufferToWav に渡せる軽量互換オブジェクトを生成
+  const clipBuf = {
+    sampleRate: sr,
+    numberOfChannels: 1,
+    length: mono.length,
+    getChannelData: () => mono,
+  };
   return audioBufferToWav(clipBuf);
 }
 
