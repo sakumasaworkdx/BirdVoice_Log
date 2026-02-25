@@ -189,6 +189,9 @@ let analyzer = {
   gain: null,
   inited: false,
   duration: 0,
+  // ファイル全体のデコード済みAudioBuffer（タイル・エクスポート共用キャッシュ）
+  fullBuffer: null,
+  fullBufferFile: null, // キャッシュ対象ファイルの参照
 };
 
 async function ensureFullAudioMetadata(file) {
@@ -247,6 +250,43 @@ async function initAnalyzerForFile(file) {
 
   analyzer.file = file;
   analyzer.inited = true;
+}
+
+/**
+ * ファイル全体をデコードした AudioBuffer を返す（キャッシュ付き）。
+ * MP3/AAC はバイトスライスだとヘッダーがなくなり decodeAudioData が失敗するため、
+ * ファイル全体を1回だけデコードしてキャッシュし、タイル・エクスポートで共有する。
+ * ファイルが変わった場合（再ロード時）はキャッシュを破棄して再デコードする。
+ */
+let _fullBufferPromise = null;
+async function getFullAudioBuffer() {
+  if (!analyzer.file) throw new Error('ファイル未ロード');
+
+  // 同じファイルのキャッシュがあればそれを返す
+  if (analyzer.fullBuffer && analyzer.fullBufferFile === analyzer.file) {
+    return analyzer.fullBuffer;
+  }
+
+  // 既に進行中のデコードがあれば待つ（重複デコード防止）
+  if (_fullBufferPromise) return _fullBufferPromise;
+
+  _fullBufferPromise = (async () => {
+    logLine('音声をデコード中...');
+    const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+    try {
+      const ab  = await analyzer.file.arrayBuffer();
+      const buf = await decodeCtx.decodeAudioData(ab);
+      analyzer.fullBuffer     = buf;
+      analyzer.fullBufferFile = analyzer.file;
+      logLine(`デコード完了 (${buf.sampleRate} Hz, ${buf.numberOfChannels}ch, ${buf.duration.toFixed(1)}s)`);
+      return buf;
+    } finally {
+      try { decodeCtx.close(); } catch {}
+      _fullBufferPromise = null;
+    }
+  })();
+
+  return _fullBufferPromise;
 }
 
 /** ===================== Tile cache (LRU) ===================== */
@@ -446,31 +486,26 @@ function yToHzByScale(y, cfg, plotH){
 }
 
 async function generateTileBitmap(tileIndex, cfg, abortSignal) {
-  const tileStart = tileIndex * cfg.tileSec;
-  const tileEnd   = Math.min(analyzer.duration, tileStart + cfg.tileSec);
+  const tileStart     = tileIndex * cfg.tileSec;
+  const tileEnd       = Math.min(analyzer.duration, tileStart + cfg.tileSec);
   const targetSeconds = tileEnd - tileStart;
 
   if (!analyzer.file) throw new Error('ファイル未ロード');
+  if (abortSignal?.aborted) throw new Error('abort');
 
-  // ── デコード専用の使い捨て AudioContext を使う ─────────────────────
-  // analyzer.audioCtx には createMediaElementSource が接続されており、
-  // Chrome では同一コンテキストで decodeAudioData が失敗するケースがある。
-  // 専用コンテキストを都度作成 → 完了後に close() して GC させる。
-  const decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
-  try {
-    const bytesPerSecEst = analyzer.file.size / Math.max(1, analyzer.duration);
-    const overlapBytes   = Math.floor(bytesPerSecEst * 0.6); // 余裕を持った重複
-    const startByte = Math.max(0, Math.floor(tileStart * bytesPerSecEst) - overlapBytes);
-    const endByte   = Math.min(analyzer.file.size, Math.ceil(tileEnd * bytesPerSecEst) + overlapBytes);
+  // ── ファイル全体のデコード済みバッファを取得（MP3/AACのバイトスライス問題を回避）──
+  const fullBuf = await getFullAudioBuffer();
+  if (abortSignal?.aborted) throw new Error('abort');
 
-    if (abortSignal?.aborted) throw new Error('abort');
-    const ab  = await analyzer.file.slice(startByte, endByte).arrayBuffer();
-    if (abortSignal?.aborted) throw new Error('abort');
-    const buf = await decodeCtx.decodeAudioData(ab);
-    if (abortSignal?.aborted) throw new Error('abort');
+  const sr       = fullBuf.sampleRate;
+  const fullMono = fullBuf.getChannelData(0);
 
-    const sr   = buf.sampleRate;
-    const mono = buf.getChannelData(0);
+  // タイル区間をサンプル単位でスライス（コピーなし・高速）
+  const startSample = Math.floor(tileStart * sr);
+  const endSample   = Math.min(fullMono.length, Math.ceil(tileEnd * sr));
+  const mono        = fullMono.subarray(startSample, endSample);
+
+  {  // ブロックスコープ（try/finallyを削除しシンプルに）
 
     // ── FFT 準備 ───────────────────────────────────────────────────────
     const FFT_N   = clamp(nextPow2(cfg.fftSize), 512, 4096);
@@ -567,9 +602,6 @@ async function generateTileBitmap(tileIndex, cfg, abortSignal) {
     const bitmap = await createImageBitmap(oc);
     return { bitmap, width, height, tileIndex, tileStart, tileSec: cfg.tileSec, lastUsed: nowMs() };
 
-  } finally {
-    // 必ず close して AudioContext を解放（メモリリーク防止）
-    try { decodeCtx.close(); } catch {}
   }
 }
 
@@ -796,6 +828,9 @@ function clearAll() {
   analyzer.file = null;
   analyzer.inited = false;
   analyzer.duration = 0;
+  analyzer.fullBuffer = null;
+  analyzer.fullBufferFile = null;
+  _fullBufferPromise = null;
 
   UI.log.textContent = '';
   UI.barFill.style.width = '0%';
@@ -1603,25 +1638,19 @@ function nextPow2(n) {
  * @param {number} halfSec  前後何秒切り出すか（デフォルト5）
  */
 async function generateDetectionSpectrogram(file, timeSec, halfSec = 5) {
-  if (!analyzer.audioCtx) throw new Error('audioCtxが未初期化です');
-  if (analyzer.audioCtx.state === 'suspended') {
-    try { await analyzer.audioCtx.resume(); } catch {}
-  }
-
   const clipStart = Math.max(0, timeSec - halfSec);
   const clipEnd   = Math.min(analyzer.duration, timeSec + halfSec);
   const clipDur   = Math.max(0.1, clipEnd - clipStart);
 
-  const bytesPerSecEst = file.size / Math.max(1, analyzer.duration);
-  const overlapBytes = Math.floor(bytesPerSecEst * 0.5);
-  const startByte = Math.max(0, Math.floor(clipStart * bytesPerSecEst) - overlapBytes);
-  const endByte   = Math.min(file.size, Math.ceil(clipEnd * bytesPerSecEst) + overlapBytes);
+  // getFullAudioBuffer でキャッシュ済み全デコードを使う（MP3/AACのバイトスライス問題を回避）
+  const fullBuf = await getFullAudioBuffer();
+  const sr      = fullBuf.sampleRate;
+  const fullMono = fullBuf.getChannelData(0);
 
-  const ab  = await file.slice(startByte, endByte).arrayBuffer();
-  const buf = await analyzer.audioCtx.decodeAudioData(ab);
+  const startSample = Math.floor(clipStart * sr);
+  const endSample   = Math.min(fullMono.length, Math.ceil(clipEnd * sr));
+  const mono        = fullMono.subarray(startSample, endSample);
 
-  const sr   = buf.sampleRate;
-  const mono = buf.getChannelData(0);
   const cfg  = getConfig();
 
   const FFT_N   = clamp(nextPow2(cfg.fftSize), 512, 4096);
@@ -1788,23 +1817,28 @@ function audioBufferToWav(audioBuffer) {
  * 指定時刻 ±halfSec の音声を WAV Blob として返す
  */
 async function extractAudioClipWav(file, timeSec, halfSec = 5) {
-  if (!analyzer.audioCtx) throw new Error('audioCtxが未初期化です');
-  if (analyzer.audioCtx.state === 'suspended') {
-    try { await analyzer.audioCtx.resume(); } catch {}
-  }
-
   const clipStart = Math.max(0, timeSec - halfSec);
   const clipEnd   = Math.min(analyzer.duration, timeSec + halfSec);
 
-  const bytesPerSecEst = file.size / Math.max(1, analyzer.duration);
-  const overlapBytes = Math.floor(bytesPerSecEst * 0.5);
-  const startByte = Math.max(0, Math.floor(clipStart * bytesPerSecEst) - overlapBytes);
-  const endByte   = Math.min(file.size, Math.ceil(clipEnd * bytesPerSecEst) + overlapBytes);
+  // getFullAudioBuffer でキャッシュ済みバッファからサンプル単位でスライス
+  const fullBuf = await getFullAudioBuffer();
+  const sr      = fullBuf.sampleRate;
+  const numCh   = fullBuf.numberOfChannels;
 
-  const ab  = await file.slice(startByte, endByte).arrayBuffer();
-  const buf = await analyzer.audioCtx.decodeAudioData(ab);
+  const startSample = Math.floor(clipStart * sr);
+  const endSample   = Math.min(fullBuf.length, Math.ceil(clipEnd * sr));
+  const clipLen     = endSample - startSample;
 
-  return audioBufferToWav(buf);
+  // AudioBuffer を手動生成してチャンネルデータをコピー
+  const clipCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sr });
+  const clipBuf = clipCtx.createBuffer(numCh, clipLen, sr);
+  for (let ch = 0; ch < numCh; ch++) {
+    const src = fullBuf.getChannelData(ch).subarray(startSample, endSample);
+    clipBuf.copyToChannel(src, ch);
+  }
+  try { clipCtx.close(); } catch {}
+
+  return audioBufferToWav(clipBuf);
 }
 
 /**
